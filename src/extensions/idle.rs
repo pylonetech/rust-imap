@@ -2,12 +2,11 @@
 //! 2177](https://tools.ietf.org/html/rfc2177).
 
 use crate::client::Session;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::parse::parse_idle;
 use crate::types::UnsolicitedResponse;
 use tokio::{io::{AsyncRead, AsyncWrite}};
 use std::time::Duration;
-use async_recursion::async_recursion;
 
 /// `Handle` allows a client to block waiting for changes to the remote mailbox.
 ///
@@ -186,12 +185,7 @@ impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Handle<'a, T> {
         // though it need only "poll" at half hour intervals.
         // TODO
         let res = self.wait_inner(callback).await;
+        self.terminate().await.unwrap();
         res
-    }
-}
-
-impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Drop for Handle<'a, T> {
-    fn drop(&mut self) {
-        let _ = futures::executor::block_on(self.terminate()).is_ok();
     }
 }
