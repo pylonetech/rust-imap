@@ -1,9 +1,8 @@
 use base64::{engine::general_purpose, Engine as _};
-use bufstream::BufStream;
 use chrono::{DateTime, FixedOffset};
 use imap_proto::Response;
+use tokio::io::{AsyncRead, AsyncWrite, BufStream, AsyncWriteExt, AsyncBufReadExt};
 use std::collections::HashSet;
-use std::io::{Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::str;
 use std::sync::mpsc;
@@ -136,7 +135,7 @@ fn validate_sequence_set(
 // Both `Client` and `Session` deref to [`Connection`](struct.Connection.html), the underlying
 // primitives type.
 #[derive(Debug)]
-pub struct Session<T: Read + Write> {
+pub struct Session<T: AsyncRead + AsyncWrite + std::marker::Unpin> {
     conn: Connection<T>,
     pub(crate) unsolicited_responses_tx: mpsc::Sender<UnsolicitedResponse>,
 
@@ -151,7 +150,7 @@ pub struct Session<T: Read + Write> {
 // Both `Client` and `Session` deref to [`Connection`](struct.Connection.html), the underlying
 // primitives type.
 #[derive(Debug)]
-pub struct Client<T: Read + Write> {
+pub struct Client<T: AsyncRead + AsyncWrite + std::marker::Unpin> {
     conn: Connection<T>,
 }
 
@@ -159,7 +158,7 @@ pub struct Client<T: Read + Write> {
 /// login) use a `Connection` internally for the TCP stream primitives.
 #[derive(Debug)]
 #[doc(hidden)]
-pub struct Connection<T: Read + Write> {
+pub struct Connection<T: AsyncRead + AsyncWrite + std::marker::Unpin> {
     pub(crate) stream: BufStream<T>,
     tag: u32,
 
@@ -173,7 +172,7 @@ pub struct Connection<T: Read + Write> {
 
 /// A builder for the append command
 #[must_use]
-pub struct AppendCmd<'a, T: Read + Write> {
+pub struct AppendCmd<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin> {
     session: &'a mut Session<T>,
     content: &'a [u8],
     mailbox: &'a str,
@@ -181,7 +180,7 @@ pub struct AppendCmd<'a, T: Read + Write> {
     date: Option<DateTime<FixedOffset>>,
 }
 
-impl<'a, T: Read + Write> AppendCmd<'a, T> {
+impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin> AppendCmd<'a, T> {
     /// The [`APPEND` command](https://tools.ietf.org/html/rfc3501#section-6.3.11) can take
     /// an optional FLAGS parameter to set the flags on the new message.
     ///
@@ -217,7 +216,7 @@ impl<'a, T: Read + Write> AppendCmd<'a, T> {
     ///
     /// Note: be sure to set flags and optional date before you
     /// finish the command.
-    pub fn finish(&mut self) -> Result<Appended> {
+    pub async fn finish(&mut self) -> Result<Appended> {
         let flagstr = iter_join(self.flags.iter().filter(|f| **f != Flag::Recent), " ");
 
         let datestr = if let Some(date) = self.date {
@@ -232,24 +231,25 @@ impl<'a, T: Read + Write> AppendCmd<'a, T> {
             flagstr,
             datestr,
             self.content.len()
-        ))?;
+        )).await?;
         let mut v = Vec::new();
-        self.session.readline(&mut v)?;
+        self.session.readline(&mut v).await?;
         if !v.starts_with(b"+") {
             return Err(Error::Append);
         }
-        self.session.stream.write_all(self.content)?;
-        self.session.stream.write_all(b"\r\n")?;
-        self.session.stream.flush()?;
+        self.session.stream.write_all(self.content).await?;
+        self.session.stream.write_all(b"\r\n").await?;
+        self.session.stream.flush().await?;
         self.session
             .read_response()
+            .await
             .and_then(|(lines, _)| parse_append(&lines, &mut self.session.unsolicited_responses_tx))
     }
 }
 
 // `Deref` instances are so we can make use of the same underlying primitives in `Client` and
 // `Session`
-impl<T: Read + Write> Deref for Client<T> {
+impl<T: AsyncRead + AsyncWrite + std::marker::Unpin> Deref for Client<T> {
     type Target = Connection<T>;
 
     fn deref(&self) -> &Connection<T> {
@@ -257,13 +257,13 @@ impl<T: Read + Write> Deref for Client<T> {
     }
 }
 
-impl<T: Read + Write> DerefMut for Client<T> {
+impl<T: AsyncRead + AsyncWrite + std::marker::Unpin> DerefMut for Client<T> {
     fn deref_mut(&mut self) -> &mut Connection<T> {
         &mut self.conn
     }
 }
 
-impl<T: Read + Write> Deref for Session<T> {
+impl<T: AsyncRead + AsyncWrite + std::marker::Unpin> Deref for Session<T> {
     type Target = Connection<T>;
 
     fn deref(&self) -> &Connection<T> {
@@ -271,7 +271,7 @@ impl<T: Read + Write> Deref for Session<T> {
     }
 }
 
-impl<T: Read + Write> DerefMut for Session<T> {
+impl<T: AsyncRead + AsyncWrite + std::marker::Unpin> DerefMut for Session<T> {
     fn deref_mut(&mut self) -> &mut Connection<T> {
         &mut self.conn
     }
@@ -293,7 +293,7 @@ macro_rules! ok_or_unauth_client_err {
     };
 }
 
-impl<T: Read + Write> Client<T> {
+impl<T: AsyncRead + AsyncWrite + std::marker::Unpin> Client<T> {
     /// Creates a new client over the given stream.
     ///
     /// This method primarily exists for writing tests that mock the underlying transport,
@@ -341,7 +341,7 @@ impl<T: Read + Write> Client<T> {
     /// This consumes `self` since the Client is not much use without
     /// an underlying transport.
     pub(crate) fn into_inner(self) -> Result<T> {
-        let res = self.conn.stream.into_inner()?;
+        let res = self.conn.stream.into_inner();
         Ok(res)
     }
 
@@ -369,7 +369,7 @@ impl<T: Read + Write> Client<T> {
     /// }
     /// # }
     /// ```
-    pub fn login(
+    pub async fn login(
         mut self,
         username: impl AsRef<str>,
         password: impl AsRef<str>,
@@ -380,7 +380,7 @@ impl<T: Read + Write> Client<T> {
         let p =
             ok_or_unauth_client_err!(validate_str(synopsis, "password", password.as_ref()), self);
         ok_or_unauth_client_err!(
-            self.run_command_and_check_ok(&format!("LOGIN {} {}", u, p)),
+            self.run_command_and_check_ok(&format!("LOGIN {} {}", u, p)).await,
             self
         );
 
@@ -427,20 +427,20 @@ impl<T: Read + Write> Client<T> {
     ///     };
     /// }
     /// ```
-    pub fn authenticate<A: Authenticator>(
+    pub async fn authenticate<A: Authenticator>(
         mut self,
         auth_type: impl AsRef<str>,
         authenticator: &A,
     ) -> ::std::result::Result<Session<T>, (Error, Client<T>)> {
         ok_or_unauth_client_err!(
-            self.run_command(&format!("AUTHENTICATE {}", auth_type.as_ref())),
+            self.run_command(&format!("AUTHENTICATE {}", auth_type.as_ref())).await,
             self
         );
-        self.do_auth_handshake(authenticator)
+        self.do_auth_handshake(authenticator).await
     }
 
     /// This func does the handshake process once the authenticate command is made.
-    fn do_auth_handshake<A: Authenticator>(
+    async fn do_auth_handshake<A: Authenticator>(
         mut self,
         authenticator: &A,
     ) -> ::std::result::Result<Session<T>, (Error, Client<T>)> {
@@ -450,7 +450,7 @@ impl<T: Read + Write> Client<T> {
 
             // explicit match blocks neccessary to convert error to tuple and not bind self too
             // early (see also comment on `login`)
-            ok_or_unauth_client_err!(self.readline(&mut line), self);
+            ok_or_unauth_client_err!(self.readline(&mut line).await, self);
 
             // ignore server comments
             if line.starts_with(b"* ") {
@@ -485,18 +485,18 @@ impl<T: Read + Write> Client<T> {
                 let raw_response = &authenticator.process(&challenge);
                 let auth_response = general_purpose::STANDARD.encode(raw_response);
                 ok_or_unauth_client_err!(
-                    self.write_line(auth_response.into_bytes().as_slice()),
+                    self.write_line(auth_response.into_bytes().as_slice()).await,
                     self
                 );
             } else {
-                ok_or_unauth_client_err!(self.read_response_onto(&mut line), self);
+                ok_or_unauth_client_err!(self.read_response_onto(&mut line).await, self);
                 return Ok(Session::new(self.conn));
             }
         }
     }
 }
 
-impl<T: Read + Write> Session<T> {
+impl<T: AsyncRead + AsyncWrite + std::marker::Unpin> Session<T> {
     // not public, just to avoid duplicating the channel creation code
     fn new(conn: Connection<T>) -> Self {
         let (tx, rx) = mpsc::channel();
@@ -525,11 +525,12 @@ impl<T: Read + Write> Session<T> {
     /// [`Connection::run_command_and_read_response`], you *may* see additional untagged `RECENT`,
     /// `EXISTS`, `FETCH`, and `EXPUNGE` responses. You can get them from the
     /// `unsolicited_responses` channel of the [`Session`](struct.Session.html).
-    pub fn select(&mut self, mailbox_name: impl AsRef<str>) -> Result<Mailbox> {
+    pub async fn select(&mut self, mailbox_name: impl AsRef<str>) -> Result<Mailbox> {
         self.run(&format!(
             "SELECT {}",
             validate_str("SELECT", "mailbox", mailbox_name.as_ref())?
         ))
+        .await
         .and_then(|(lines, _)| parse_mailbox(&lines[..], &mut self.unsolicited_responses_tx))
     }
 
@@ -537,11 +538,12 @@ impl<T: Read + Write> Session<T> {
     /// however, the selected mailbox is identified as read-only. No changes to the permanent state
     /// of the mailbox, including per-user state, will happen in a mailbox opened with `examine`;
     /// in particular, messagess cannot lose [`Flag::Recent`] in an examined mailbox.
-    pub fn examine(&mut self, mailbox_name: impl AsRef<str>) -> Result<Mailbox> {
+    pub async fn examine(&mut self, mailbox_name: impl AsRef<str>) -> Result<Mailbox> {
         self.run(&format!(
             "EXAMINE {}",
             validate_str("EXAMINE", "mailbox", mailbox_name.as_ref())?
         ))
+        .await
         .and_then(|(lines, _)| parse_mailbox(&lines[..], &mut self.unsolicited_responses_tx))
     }
 
@@ -603,7 +605,7 @@ impl<T: Read + Write> Session<T> {
     ///  - `RFC822.HEADER`: Functionally equivalent to `BODY.PEEK[HEADER]`.
     ///  - `RFC822.SIZE`: The [RFC-2822](https://tools.ietf.org/html/rfc2822) size of the message.
     ///  - `UID`: The unique identifier for the message.
-    pub fn fetch(
+    pub async fn fetch(
         &mut self,
         sequence_set: impl AsRef<str>,
         query: impl AsRef<str>,
@@ -617,13 +619,14 @@ impl<T: Read + Write> Session<T> {
                 validate_sequence_set(synopsis, "seq", sequence_set.as_ref())?,
                 validate_str_noquote(synopsis, "query", query.as_ref())?
             ))
+            .await
             .and_then(|lines| Fetches::parse(lines, &mut self.unsolicited_responses_tx))
         }
     }
 
     /// Equivalent to [`Session::fetch`], except that all identifiers in `uid_set` are
     /// [`Uid`]s. See also the [`UID` command](https://tools.ietf.org/html/rfc3501#section-6.4.8).
-    pub fn uid_fetch(
+    pub async fn uid_fetch(
         &mut self,
         uid_set: impl AsRef<str>,
         query: impl AsRef<str>,
@@ -637,18 +640,20 @@ impl<T: Read + Write> Session<T> {
                 validate_sequence_set(synopsis, "seq", uid_set.as_ref())?,
                 validate_str_noquote(synopsis, "query", query.as_ref())?
             ))
+            .await
             .and_then(|lines| Fetches::parse(lines, &mut self.unsolicited_responses_tx))
         }
     }
 
     /// Noop always succeeds, and it does nothing.
-    pub fn noop(&mut self) -> Result<()> {
+    pub async fn noop(&mut self) -> Result<()> {
         self.run_command_and_read_response("NOOP")
+            .await
             .and_then(|lines| parse_noop(lines, &mut self.unsolicited_responses_tx))
     }
 
     /// Logout informs the server that the client is done with the connection.
-    pub fn logout(&mut self) -> Result<()> {
+    pub async fn logout(&mut self) -> Result<()> {
         // Check for OK or BYE.
         // According to the RFC:
         // https://datatracker.ietf.org/doc/html/rfc3501#section-6.1.3
@@ -656,7 +661,7 @@ impl<T: Read + Write> Session<T> {
         // Apparently some servers send a tagged BYE (imap.wp.pl #210)
         // instead, so we just treat it like OK since we are logging out
         // anyway and this avoids returning an error on logout.
-        match self.run_command_and_check_ok("LOGOUT") {
+        match self.run_command_and_check_ok("LOGOUT").await {
             Ok(_) => Ok(()),
             Err(Error::Bye(_)) => Ok(()),
             resp => resp,
@@ -685,11 +690,11 @@ impl<T: Read + Write> Session<T> {
     /// the mailbox UNLESS the new incarnation has a different unique identifier validity value.
     /// See the description of the [`UID`
     /// command](https://tools.ietf.org/html/rfc3501#section-6.4.8) for more detail.
-    pub fn create(&mut self, mailbox_name: impl AsRef<str>) -> Result<()> {
+    pub async fn create(&mut self, mailbox_name: impl AsRef<str>) -> Result<()> {
         self.run_command_and_check_ok(&format!(
             "CREATE {}",
             validate_str("CREATE", "mailbox", mailbox_name.as_ref())?
-        ))
+        )).await
     }
 
     /// The [`DELETE` command](https://tools.ietf.org/html/rfc3501#section-6.3.4) permanently
@@ -711,11 +716,11 @@ impl<T: Read + Write> Session<T> {
     /// incarnation, UNLESS the new incarnation has a different unique identifier validity value.
     /// See the description of the [`UID`
     /// command](https://tools.ietf.org/html/rfc3501#section-6.4.8) for more detail.
-    pub fn delete(&mut self, mailbox_name: impl AsRef<str>) -> Result<()> {
+    pub async fn delete(&mut self, mailbox_name: impl AsRef<str>) -> Result<()> {
         self.run_command_and_check_ok(&format!(
             "DELETE {}",
             validate_str("DELETE", "mailbox", mailbox_name.as_ref())?
-        ))
+        )).await
     }
 
     /// The [`RENAME` command](https://tools.ietf.org/html/rfc3501#section-6.3.5) changes the name
@@ -743,12 +748,12 @@ impl<T: Read + Write> Session<T> {
     /// to a new mailbox with the given name, leaving `INBOX` empty.  If the server implementation
     /// supports inferior hierarchical names of `INBOX`, these are unaffected by a rename of
     /// `INBOX`.
-    pub fn rename(&mut self, from: impl AsRef<str>, to: impl AsRef<str>) -> Result<()> {
+    pub async fn rename(&mut self, from: impl AsRef<str>, to: impl AsRef<str>) -> Result<()> {
         self.run_command_and_check_ok(&format!(
             "RENAME {} {}",
             quote!(from.as_ref()),
             quote!(to.as_ref())
-        ))
+        )).await
     }
 
     /// The [`SUBSCRIBE` command](https://tools.ietf.org/html/rfc3501#section-6.3.6) adds the
@@ -759,32 +764,34 @@ impl<T: Read + Write> Session<T> {
     /// The server may validate the mailbox argument to `SUBSCRIBE` to verify that it exists.
     /// However, it will not unilaterally remove an existing mailbox name from the subscription
     /// list even if a mailbox by that name no longer exists.
-    pub fn subscribe(&mut self, mailbox: impl AsRef<str>) -> Result<()> {
-        self.run_command_and_check_ok(&format!("SUBSCRIBE {}", quote!(mailbox.as_ref())))
+    pub async fn subscribe(&mut self, mailbox: impl AsRef<str>) -> Result<()> {
+        self.run_command_and_check_ok(&format!("SUBSCRIBE {}", quote!(mailbox.as_ref()))).await
     }
 
     /// The [`UNSUBSCRIBE` command](https://tools.ietf.org/html/rfc3501#section-6.3.7) removes the
     /// specified mailbox name from the server's set of "active" or "subscribed" mailboxes as
     /// returned by [`Session::lsub`].  This command returns `Ok` only if the unsubscription is
     /// successful.
-    pub fn unsubscribe(&mut self, mailbox: impl AsRef<str>) -> Result<()> {
-        self.run_command_and_check_ok(&format!("UNSUBSCRIBE {}", quote!(mailbox.as_ref())))
+    pub async fn unsubscribe(&mut self, mailbox: impl AsRef<str>) -> Result<()> {
+        self.run_command_and_check_ok(&format!("UNSUBSCRIBE {}", quote!(mailbox.as_ref()))).await
     }
 
     /// The [`CAPABILITY` command](https://tools.ietf.org/html/rfc3501#section-6.1.1) requests a
     /// listing of capabilities that the server supports.  The server will include "IMAP4rev1" as
     /// one of the listed capabilities. See [`Capabilities`] for further details.
-    pub fn capabilities(&mut self) -> Result<Capabilities> {
+    pub async fn capabilities(&mut self) -> Result<Capabilities> {
         self.run_command_and_read_response("CAPABILITY")
+            .await
             .and_then(|lines| Capabilities::parse(lines, &mut self.unsolicited_responses_tx))
     }
 
     /// The [`EXPUNGE` command](https://tools.ietf.org/html/rfc3501#section-6.4.3) permanently
     /// removes all messages that have [`Flag::Deleted`] set from the currently selected mailbox.
     /// The message sequence number of each message that is removed is returned.
-    pub fn expunge(&mut self) -> Result<Deleted> {
-        self.run_command("EXPUNGE")?;
+    pub async fn expunge(&mut self) -> Result<Deleted> {
+        self.run_command("EXPUNGE").await?;
         self.read_response()
+            .await
             .and_then(|(lines, _)| parse_expunge(lines, &mut self.unsolicited_responses_tx))
     }
 
@@ -810,9 +817,10 @@ impl<T: Read + Write> Session<T> {
     ///
     /// Alternatively, the client may fall back to using just [`Session::expunge`], risking the
     /// unintended removal of some messages.
-    pub fn uid_expunge(&mut self, uid_set: impl AsRef<str>) -> Result<Deleted> {
-        self.run_command(&format!("UID EXPUNGE {}", uid_set.as_ref()))?;
+    pub async fn uid_expunge(&mut self, uid_set: impl AsRef<str>) -> Result<Deleted> {
+        self.run_command(&format!("UID EXPUNGE {}", uid_set.as_ref())).await?;
         self.read_response()
+            .await
             .and_then(|(lines, _)| parse_expunge(lines, &mut self.unsolicited_responses_tx))
     }
 
@@ -826,8 +834,8 @@ impl<T: Read + Write> Session<T> {
     ///
     /// There is no guarantee that an `EXISTS` untagged response will happen as a result of
     /// `CHECK`.  [`Session::noop`] SHOULD be used for new message polling.
-    pub fn check(&mut self) -> Result<()> {
-        self.run_command_and_check_ok("CHECK")
+    pub async fn check(&mut self) -> Result<()> {
+        self.run_command_and_check_ok("CHECK").await
     }
 
     /// The [`CLOSE` command](https://tools.ietf.org/html/rfc3501#section-6.4.2) permanently
@@ -845,8 +853,8 @@ impl<T: Read + Write> Session<T> {
     /// deleted, a `CLOSE-LOGOUT` or `CLOSE-SELECT` sequence is considerably faster than an
     /// `EXPUNGE-LOGOUT` or `EXPUNGE-SELECT` because no `EXPUNGE` responses (which the client would
     /// probably ignore) are sent.
-    pub fn close(&mut self) -> Result<()> {
-        self.run_command_and_check_ok("CLOSE")
+    pub async fn close(&mut self) -> Result<()> {
+        self.run_command_and_check_ok("CLOSE").await
     }
 
     /// The [`STORE` command](https://tools.ietf.org/html/rfc3501#section-6.4.6) alters data
@@ -893,7 +901,7 @@ impl<T: Read + Write> Session<T> {
     ///     Ok(())
     /// }
     /// ```
-    pub fn store(
+    pub async fn store(
         &mut self,
         sequence_set: impl AsRef<str>,
         query: impl AsRef<str>,
@@ -903,12 +911,13 @@ impl<T: Read + Write> Session<T> {
             sequence_set.as_ref(),
             query.as_ref()
         ))
+        .await
         .and_then(|lines| Fetches::parse(lines, &mut self.unsolicited_responses_tx))
     }
 
     /// Equivalent to [`Session::store`], except that all identifiers in `sequence_set` are
     /// [`Uid`]s. See also the [`UID` command](https://tools.ietf.org/html/rfc3501#section-6.4.8).
-    pub fn uid_store(
+    pub async fn uid_store(
         &mut self,
         uid_set: impl AsRef<str>,
         query: impl AsRef<str>,
@@ -918,6 +927,7 @@ impl<T: Read + Write> Session<T> {
             uid_set.as_ref(),
             query.as_ref()
         ))
+        .await
         .and_then(|lines| Fetches::parse(lines, &mut self.unsolicited_responses_tx))
     }
 
@@ -928,7 +938,7 @@ impl<T: Read + Write> Session<T> {
     ///
     /// If the `COPY` command is unsuccessful for any reason, the server restores the destination
     /// mailbox to its state before the `COPY` attempt.
-    pub fn copy(
+    pub async fn copy(
         &mut self,
         sequence_set: impl AsRef<str>,
         mailbox_name: impl AsRef<str>,
@@ -937,12 +947,12 @@ impl<T: Read + Write> Session<T> {
             "COPY {} {}",
             sequence_set.as_ref(),
             mailbox_name.as_ref()
-        ))
+        )).await
     }
 
     /// Equivalent to [`Session::copy`], except that all identifiers in `sequence_set` are
     /// [`Uid`]s. See also the [`UID` command](https://tools.ietf.org/html/rfc3501#section-6.4.8).
-    pub fn uid_copy(
+    pub async fn uid_copy(
         &mut self,
         uid_set: impl AsRef<str>,
         mailbox_name: impl AsRef<str>,
@@ -951,7 +961,7 @@ impl<T: Read + Write> Session<T> {
             "UID COPY {} {}",
             uid_set.as_ref(),
             mailbox_name.as_ref()
-        ))
+        )).await
     }
 
     /// The [`MOVE` command](https://tools.ietf.org/html/rfc6851#section-3.1) takes two
@@ -984,7 +994,7 @@ impl<T: Read + Write> Session<T> {
     /// orphaned).  The server will generally not leave any message in both mailboxes (it would be
     /// bad for a partial failure to result in a bunch of duplicate messages).  This is true even
     /// if the server returns with [`Error::No`].
-    pub fn mv(
+    pub async fn mv(
         &mut self,
         sequence_set: impl AsRef<str>,
         mailbox_name: impl AsRef<str>,
@@ -993,14 +1003,14 @@ impl<T: Read + Write> Session<T> {
             "MOVE {} {}",
             sequence_set.as_ref(),
             validate_str("MOVE", "mailbox", mailbox_name.as_ref())?
-        ))
+        )).await
     }
 
     /// Equivalent to [`Session::mv`], except that all identifiers in `sequence_set` are
     /// [`Uid`]s. See also the [`UID` command](https://tools.ietf.org/html/rfc3501#section-6.4.8)
     /// and the [semantics of `MOVE` and `UID
     /// MOVE`](https://tools.ietf.org/html/rfc6851#section-3.3).
-    pub fn uid_mv(
+    pub async fn uid_mv(
         &mut self,
         uid_set: impl AsRef<str>,
         mailbox_name: impl AsRef<str>,
@@ -1009,7 +1019,7 @@ impl<T: Read + Write> Session<T> {
             "UID MOVE {} {}",
             uid_set.as_ref(),
             validate_str("UID MOVE", "mailbox", mailbox_name.as_ref())?
-        ))
+        )).await
     }
 
     /// The [`LIST` command](https://tools.ietf.org/html/rfc3501#section-6.3.8) returns a subset of
@@ -1043,7 +1053,7 @@ impl<T: Read + Write> Session<T> {
     /// arguments with wildcards.  The criteria for omitting `INBOX` is whether `SELECT INBOX` will
     /// return failure; it is not relevant whether the user's real `INBOX` resides on this or some
     /// other server.
-    pub fn list(
+    pub async fn list(
         &mut self,
         reference_name: Option<&str>,
         mailbox_pattern: Option<&str>,
@@ -1053,6 +1063,7 @@ impl<T: Read + Write> Session<T> {
             quote!(reference_name.unwrap_or("")),
             mailbox_pattern.unwrap_or("\"\"")
         ))
+        .await
         .and_then(|lines| Names::parse(lines, &mut self.unsolicited_responses_tx))
     }
 
@@ -1071,7 +1082,7 @@ impl<T: Read + Write> Session<T> {
     ///
     /// The server will not unilaterally remove an existing mailbox name from the subscription list
     /// even if a mailbox by that name no longer exists.
-    pub fn lsub(
+    pub async fn lsub(
         &mut self,
         reference_name: Option<&str>,
         mailbox_pattern: Option<&str>,
@@ -1081,6 +1092,7 @@ impl<T: Read + Write> Session<T> {
             quote!(reference_name.unwrap_or("")),
             mailbox_pattern.unwrap_or("")
         ))
+        .await
         .and_then(|lines| Names::parse(lines, &mut self.unsolicited_responses_tx))
     }
 
@@ -1119,7 +1131,7 @@ impl<T: Read + Write> Session<T> {
     ///  - `HIGHESTMODSEQ`: The highest mod sequence of the mailbox, counting modifications made to it.
     ///
     /// `data_items` is a space-separated list enclosed in parentheses.
-    pub fn status(
+    pub async fn status(
         &mut self,
         mailbox_name: impl AsRef<str>,
         data_items: impl AsRef<str>,
@@ -1130,6 +1142,7 @@ impl<T: Read + Write> Session<T> {
             validate_str("STATUS", "mailbox", mailbox_name)?,
             data_items.as_ref()
         ))
+        .await
         .and_then(|lines| {
             parse_status(&lines[..], mailbox_name, &mut self.unsolicited_responses_tx)
         })
@@ -1231,16 +1244,18 @@ impl<T: Read + Write> Session<T> {
     ///
     ///  - `BEFORE <date>`: Messages whose internal date (disregarding time and timezone) is earlier than the specified date.
     ///  - `SINCE <date>`: Messages whose internal date (disregarding time and timezone) is within or later than the specified date.
-    pub fn search(&mut self, query: impl AsRef<str>) -> Result<HashSet<Seq>> {
+    pub async fn search(&mut self, query: impl AsRef<str>) -> Result<HashSet<Seq>> {
         self.run_command_and_read_response(&format!("SEARCH {}", query.as_ref()))
+            .await
             .and_then(|lines| parse_id_set(&lines, &mut self.unsolicited_responses_tx))
     }
 
     /// Equivalent to [`Session::search`], except that the returned identifiers
     /// are [`Uid`] instead of [`Seq`]. See also the [`UID`
     /// command](https://tools.ietf.org/html/rfc3501#section-6.4.8).
-    pub fn uid_search(&mut self, query: impl AsRef<str>) -> Result<HashSet<Uid>> {
+    pub async fn uid_search(&mut self, query: impl AsRef<str>) -> Result<HashSet<Uid>> {
         self.run_command_and_read_response(&format!("UID SEARCH {}", query.as_ref()))
+            .await
             .and_then(|lines| parse_id_set(&lines, &mut self.unsolicited_responses_tx))
     }
 
@@ -1249,7 +1264,7 @@ impl<T: Read + Write> Session<T> {
     ///
     /// This command is like [`Session::search`], except that
     /// the results are also sorted according to the supplied criteria (subject to the given charset).
-    pub fn sort(
+    pub async fn sort(
         &mut self,
         criteria: &[extensions::sort::SortCriterion<'_>],
         charset: extensions::sort::SortCharset<'_>,
@@ -1261,13 +1276,14 @@ impl<T: Read + Write> Session<T> {
             charset,
             query.as_ref()
         ))
+        .await
         .and_then(|lines| parse_id_seq(&lines, &mut self.unsolicited_responses_tx))
     }
 
     /// Equivalent to [`Session::sort`], except that it returns [`Uid`]s.
     ///
     /// See also [`Session::uid_search`].
-    pub fn uid_sort(
+    pub async fn uid_sort(
         &mut self,
         criteria: &[extensions::sort::SortCriterion<'_>],
         charset: extensions::sort::SortCharset<'_>,
@@ -1279,6 +1295,7 @@ impl<T: Read + Write> Session<T> {
             charset,
             query.as_ref()
         ))
+        .await
         .and_then(|lines| parse_id_seq(&lines, &mut self.unsolicited_responses_tx))
     }
 
@@ -1289,7 +1306,7 @@ impl<T: Read + Write> Session<T> {
     ///
     /// This method only works against a server with the ACL capability. Otherwise [`Error::Bad`]
     /// will be returned
-    pub fn set_acl(
+    pub async fn set_acl(
         &mut self,
         mailbox_name: impl AsRef<str>,
         identifier: impl AsRef<str>,
@@ -1308,7 +1325,7 @@ impl<T: Read + Write> Session<T> {
             validate_str("SETACL", "identifier", identifier.as_ref())?,
             mod_str,
             rights,
-        ))
+        )).await
     }
 
     /// The [`DELETEACL` command](https://datatracker.ietf.org/doc/html/rfc4314#section-3.2)
@@ -1318,7 +1335,7 @@ impl<T: Read + Write> Session<T> {
     ///
     /// This method only works against a server with the ACL capability. Otherwise [`Error::Bad`]
     /// will be returned
-    pub fn delete_acl(
+    pub async fn delete_acl(
         &mut self,
         mailbox_name: impl AsRef<str>,
         identifier: impl AsRef<str>,
@@ -1327,7 +1344,7 @@ impl<T: Read + Write> Session<T> {
             "DELETEACL {} {}",
             validate_str("DELETEACL", "mailbox", mailbox_name.as_ref())?,
             validate_str("DELETEACL", "identifier", identifier.as_ref())?,
-        ))
+        )).await
     }
 
     /// The [`GETACL` command](https://datatracker.ietf.org/doc/html/rfc4314#section-3.3)
@@ -1337,11 +1354,12 @@ impl<T: Read + Write> Session<T> {
     ///
     /// This method only works against a server with the ACL capability. Otherwise [`Error::Bad`]
     /// will be returned
-    pub fn get_acl(&mut self, mailbox_name: impl AsRef<str>) -> Result<AclResponse> {
+    pub async fn get_acl(&mut self, mailbox_name: impl AsRef<str>) -> Result<AclResponse> {
         self.run_command_and_read_response(&format!(
             "GETACL {}",
             validate_str("GETACL", "mailbox", mailbox_name.as_ref())?
         ))
+        .await
         .and_then(|lines| AclResponse::parse(lines, &mut self.unsolicited_responses_tx))
     }
 
@@ -1353,7 +1371,7 @@ impl<T: Read + Write> Session<T> {
     ///
     /// This method only works against a server with the ACL capability. Otherwise [`Error::Bad`]
     /// will be returned
-    pub fn list_rights(
+    pub async fn list_rights(
         &mut self,
         mailbox_name: impl AsRef<str>,
         identifier: impl AsRef<str>,
@@ -1363,6 +1381,7 @@ impl<T: Read + Write> Session<T> {
             validate_str("LISTRIGHTS", "mailbox", mailbox_name.as_ref())?,
             validate_str("LISTRIGHTS", "identifier", identifier.as_ref())?
         ))
+        .await
         .and_then(|lines| ListRightsResponse::parse(lines, &mut self.unsolicited_responses_tx))
     }
 
@@ -1372,11 +1391,12 @@ impl<T: Read + Write> Session<T> {
     ///
     /// This method only works against a server with the ACL capability. Otherwise [`Error::Bad`]
     /// will be returned
-    pub fn my_rights(&mut self, mailbox_name: impl AsRef<str>) -> Result<MyRightsResponse> {
+    pub async fn my_rights(&mut self, mailbox_name: impl AsRef<str>) -> Result<MyRightsResponse> {
         self.run_command_and_read_response(&format!(
             "MYRIGHTS {}",
             validate_str("MYRIGHTS", "mailbox", mailbox_name.as_ref())?,
         ))
+        .await
         .and_then(|lines| MyRightsResponse::parse(lines, &mut self.unsolicited_responses_tx))
     }
 
@@ -1386,7 +1406,7 @@ impl<T: Read + Write> Session<T> {
     /// are discarded.
     ///
     /// Returns the updated quota.
-    pub fn set_quota(
+    pub async fn set_quota(
         &mut self,
         quota_root: impl AsRef<str>,
         limits: &[QuotaResourceLimit<'_>],
@@ -1397,40 +1417,43 @@ impl<T: Read + Write> Session<T> {
             validate_str("SETQUOTA", "quota_root", quota_root.as_ref())?,
             limits,
         ))
+        .await
         .and_then(|lines| QuotaResponse::parse(lines, &mut self.unsolicited_responses_tx))
     }
 
     /// The [`GETQUOTA` command](https://datatracker.ietf.org/doc/html/rfc2087#section-4.2)
     ///
     /// Returns the quota information for the specified quota root
-    pub fn get_quota(&mut self, quota_root: impl AsRef<str>) -> Result<QuotaResponse> {
+    pub async fn get_quota(&mut self, quota_root: impl AsRef<str>) -> Result<QuotaResponse> {
         self.run_command_and_read_response(&format!(
             "GETQUOTA {}",
             validate_str("GETQUOTA", "quota_root", quota_root.as_ref())?
         ))
+        .await
         .and_then(|lines| QuotaResponse::parse(lines, &mut self.unsolicited_responses_tx))
     }
 
     /// The [`GETQUOTAROOT` command](https://datatracker.ietf.org/doc/html/rfc2087#section-4.3)
     ///
     /// Returns the quota roots along with their quota information for the specified mailbox
-    pub fn get_quota_root(&mut self, mailbox_name: impl AsRef<str>) -> Result<QuotaRootResponse> {
+    pub async fn get_quota_root(&mut self, mailbox_name: impl AsRef<str>) -> Result<QuotaRootResponse> {
         self.run_command_and_read_response(&format!(
             "GETQUOTAROOT {}",
             validate_str("GETQUOTAROOT", "mailbox", mailbox_name.as_ref())?
         ))
+        .await
         .and_then(|lines| QuotaRootResponse::parse(lines, &mut self.unsolicited_responses_tx))
     }
 
     // these are only here because they are public interface, the rest is in `Connection`
     /// Runs a command and checks if it returns OK.
-    pub fn run_command_and_check_ok(&mut self, command: impl AsRef<str>) -> Result<()> {
-        self.run_command_and_read_response(command).map(|_| ())
+    pub async fn run_command_and_check_ok(&mut self, command: impl AsRef<str>) -> Result<()> {
+        self.run_command_and_read_response(command).await.map(|_| ())
     }
 
     /// Runs any command passed to it.
-    pub fn run_command(&mut self, untagged_command: impl AsRef<str>) -> Result<()> {
-        self.conn.run_command(untagged_command.as_ref())
+    pub async fn run_command(&mut self, untagged_command: impl AsRef<str>) -> Result<()> {
+        self.conn.run_command(untagged_command.as_ref()).await
     }
 
     /// Run a raw IMAP command and read back its response.
@@ -1441,8 +1464,8 @@ impl<T: Read + Write> Session<T> {
     /// additional untagged `RECENT`, `EXISTS`, `FETCH`, and `EXPUNGE` responses!
     ///
     /// The response includes the final [`Response::Done`], which starts at the returned index.
-    pub fn run(&mut self, untagged_command: impl AsRef<str>) -> Result<(Vec<u8>, usize)> {
-        self.conn.run(untagged_command.as_ref())
+    pub async fn run(&mut self, untagged_command: impl AsRef<str>) -> Result<(Vec<u8>, usize)> {
+        self.conn.run(untagged_command.as_ref()).await
     }
 
     /// Run a raw IMAP command and read back its response.
@@ -1453,60 +1476,60 @@ impl<T: Read + Write> Session<T> {
     /// additional untagged `RECENT`, `EXISTS`, `FETCH`, and `EXPUNGE` responses!
     ///
     /// The response does not include the final [`Response::Done`].
-    pub fn run_command_and_read_response(
+    pub async fn run_command_and_read_response(
         &mut self,
         untagged_command: impl AsRef<str>,
     ) -> Result<Vec<u8>> {
-        let (mut data, ok) = self.run(untagged_command)?;
+        let (mut data, ok) = self.run(untagged_command).await?;
         data.truncate(ok);
         Ok(data)
     }
 }
 
-impl<T: Read + Write> Connection<T> {
-    /// Read the greeting from the connection. Needs to be done after `connect`ing.
+impl<T: AsyncRead + AsyncWrite + std::marker::Unpin> Connection<T> {
+    /// AsyncRead the greeting from the connection. Needs to be done after `connect`ing.
     ///
     /// Panics if called more than once on the same `Connection`.
-    pub fn read_greeting(&mut self) -> Result<Vec<u8>> {
+    pub async fn read_greeting(&mut self) -> Result<Vec<u8>> {
         assert!(!self.greeting_read, "Greeting can only be read once");
 
         let mut v = Vec::new();
-        self.readline(&mut v)?;
+        self.readline(&mut v).await?;
         self.greeting_read = true;
 
         Ok(v)
     }
 
-    pub(crate) fn run_command_and_check_ok(&mut self, command: &str) -> Result<()> {
-        self.run_command_and_read_response(command).map(|_| ())
+    pub(crate) async fn run_command_and_check_ok(&mut self, command: &str) -> Result<()> {
+        self.run_command_and_read_response(command).await.map(|_| ())
     }
 
-    fn run_command(&mut self, untagged_command: &str) -> Result<()> {
+    async fn run_command(&mut self, untagged_command: &str) -> Result<()> {
         let command = self.create_command(untagged_command);
-        self.write_line(command.into_bytes().as_slice())
+        self.write_line(command.into_bytes().as_slice()).await
     }
 
-    fn run_command_and_read_response(&mut self, untagged_command: &str) -> Result<Vec<u8>> {
-        let (mut data, ok) = self.run(untagged_command)?;
+    async fn run_command_and_read_response(&mut self, untagged_command: &str) -> Result<Vec<u8>> {
+        let (mut data, ok) = self.run(untagged_command).await?;
         data.truncate(ok);
         Ok(data)
     }
 
-    fn run(&mut self, untagged_command: &str) -> Result<(Vec<u8>, usize)> {
-        self.run_command(untagged_command)?;
-        self.read_response()
+    async fn run(&mut self, untagged_command: &str) -> Result<(Vec<u8>, usize)> {
+        self.run_command(untagged_command).await?;
+        self.read_response().await
     }
 
-    pub(crate) fn read_response(&mut self) -> Result<(Vec<u8>, usize)> {
+    pub(crate) async fn read_response(&mut self) -> Result<(Vec<u8>, usize)> {
         let mut v = Vec::new();
-        let ok = self.read_response_onto(&mut v)?;
+        let ok = self.read_response_onto(&mut v).await?;
         Ok((v, ok))
     }
 
-    /// Read responses until a Response::Done is encountered.
+    /// AsyncRead responses until a Response::Done is encountered.
     ///
     /// The `Done` is included in `data`, and the index of the `Done` is returned.
-    pub(crate) fn read_response_onto(&mut self, data: &mut Vec<u8>) -> Result<usize> {
+    pub(crate) async fn read_response_onto(&mut self, data: &mut Vec<u8>) -> Result<usize> {
         let mut continue_from = None;
         let mut try_first = !data.is_empty();
         let match_tag = format!("{}{}", TAG_PREFIX, self.tag);
@@ -1516,7 +1539,7 @@ impl<T: Read + Write> Connection<T> {
                 0
             } else {
                 let start_new = data.len();
-                self.readline(data)?;
+                self.readline(data).await?;
                 continue_from.take().unwrap_or(start_new)
             };
 
@@ -1591,9 +1614,8 @@ impl<T: Read + Write> Connection<T> {
         }
     }
 
-    pub(crate) fn readline(&mut self, into: &mut Vec<u8>) -> Result<usize> {
-        use std::io::BufRead;
-        let read = self.stream.read_until(LF, into)?;
+    pub(crate) async fn readline(&mut self, into: &mut Vec<u8>) -> Result<usize> {
+        let read = self.stream.read_until(LF, into).await?;
         if read == 0 {
             return Err(Error::ConnectionLost);
         }
@@ -1613,1435 +1635,13 @@ impl<T: Read + Write> Connection<T> {
         format!("{}{} {}", TAG_PREFIX, self.tag, command)
     }
 
-    pub(crate) fn write_line(&mut self, buf: &[u8]) -> Result<()> {
-        self.stream.write_all(buf)?;
-        self.stream.write_all(&[CR, LF])?;
-        self.stream.flush()?;
+    pub(crate) async fn write_line(&mut self, buf: &[u8]) -> Result<()> {
+        self.stream.write_all(buf).await?;
+        self.stream.write_all(&[CR, LF]).await?;
+        self.stream.flush().await?;
         if self.debug {
             eprintln!("C: {}", String::from_utf8(buf.to_vec()).unwrap());
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod testutils {
-    use crate::mock_stream::MockStream;
-
-    use super::*;
-
-    pub(crate) fn assert_validation_error_client<F>(
-        run_command: F,
-        expected_synopsis: &'static str,
-        expected_argument: &'static str,
-        expected_char: char,
-    ) where
-        F: FnOnce(
-            Client<MockStream>,
-        ) -> std::result::Result<Session<MockStream>, (Error, Client<MockStream>)>,
-    {
-        let response = Vec::new();
-        let mock_stream = MockStream::new(response);
-        let client = Client::new(mock_stream);
-        assert_eq!(
-            run_command(client)
-                .expect_err("Error expected, but got success")
-                .0
-                .to_string(),
-            Error::Validate(ValidateError {
-                command_synopsis: expected_synopsis.to_owned(),
-                argument: expected_argument.to_string(),
-                offending_char: expected_char
-            })
-            .to_string()
-        );
-    }
-
-    pub(crate) fn assert_validation_error_session<F, R>(
-        run_command: F,
-        expected_synopsis: &'static str,
-        expected_argument: &'static str,
-        expected_char: char,
-    ) where
-        F: FnOnce(Session<MockStream>) -> Result<R>,
-    {
-        let response = Vec::new();
-        let mock_stream = MockStream::new(response);
-        let session = Session::new(Client::new(mock_stream).conn);
-        assert_eq!(
-            run_command(session)
-                .map(|_| ())
-                .expect_err("Error expected, but got success")
-                .to_string(),
-            Error::Validate(ValidateError {
-                command_synopsis: expected_synopsis.to_owned(),
-                argument: expected_argument.to_string(),
-                offending_char: expected_char
-            })
-            .to_string()
-        );
-    }
-
-    pub(crate) fn assert_quota_resource(
-        resource: &QuotaResource<'_>,
-        name: QuotaResourceName<'_>,
-        limit: u64,
-        usage: u64,
-    ) {
-        assert_eq!(resource.name, name);
-        assert_eq!(resource.usage, usage);
-        assert_eq!(resource.limit, limit);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::error::Result;
-    use super::super::mock_stream::MockStream;
-    use super::*;
-    use imap_proto::types::Capability;
-    use std::borrow::Cow;
-
-    use super::testutils::*;
-
-    macro_rules! mock_session {
-        ($s:expr) => {
-            Session::new(Client::new($s).conn)
-        };
-    }
-
-    #[test]
-    fn read_response() {
-        let response = "a0 OK Logged in.\r\n";
-        let mock_stream = MockStream::new(response.as_bytes().to_vec());
-        let mut client = Client::new(mock_stream);
-        let (mut actual_response, i) = client.read_response().unwrap();
-        actual_response.truncate(i);
-        assert_eq!(Vec::<u8>::new(), actual_response);
-    }
-
-    #[test]
-    fn fetch_body() {
-        let response = "a0 OK Logged in.\r\n\
-                        * 2 FETCH (BODY[TEXT] {3}\r\nfoo)\r\n\
-                        a0 OK FETCH completed\r\n";
-        let mock_stream = MockStream::new(response.as_bytes().to_vec());
-        let mut session = mock_session!(mock_stream);
-        session.read_response().unwrap();
-        session.read_response().unwrap();
-    }
-
-    #[test]
-    fn read_greeting() {
-        let greeting = "* OK Dovecot ready.\r\n";
-        let mock_stream = MockStream::new(greeting.as_bytes().to_vec());
-        let mut client = Client::new(mock_stream);
-        client.read_greeting().unwrap();
-    }
-
-    #[test]
-    fn readline_delay_read() {
-        let greeting = "* OK Dovecot ready.\r\n";
-        let expected_response: String = greeting.to_string();
-        let mock_stream = MockStream::default()
-            .with_buf(greeting.as_bytes().to_vec())
-            .with_delay();
-        let mut client = Client::new(mock_stream);
-        let mut v = Vec::new();
-        client.readline(&mut v).unwrap();
-        let actual_response = String::from_utf8(v).unwrap();
-        assert_eq!(expected_response, actual_response);
-    }
-
-    #[test]
-    fn readline_eof() {
-        let mock_stream = MockStream::default().with_eof();
-        let mut client = Client::new(mock_stream);
-        let mut v = Vec::new();
-        if let Err(Error::ConnectionLost) = client.readline(&mut v) {
-        } else {
-            unreachable!("EOF read did not return connection lost");
-        }
-    }
-
-    #[test]
-    #[should_panic]
-    fn readline_err() {
-        // TODO Check the error test
-        let mock_stream = MockStream::default().with_err();
-        let mut client = Client::new(mock_stream);
-        let mut v = Vec::new();
-        client.readline(&mut v).unwrap();
-    }
-
-    #[test]
-    fn create_command() {
-        let base_command = "CHECK";
-        let mock_stream = MockStream::default();
-        let mut imap_stream = Client::new(mock_stream);
-
-        let expected_command = format!("a1 {}", base_command);
-        let command = imap_stream.create_command(&base_command);
-        assert!(
-            command == expected_command,
-            "expected command doesn't equal actual command"
-        );
-
-        let expected_command2 = format!("a2 {}", base_command);
-        let command2 = imap_stream.create_command(&base_command);
-        assert!(
-            command2 == expected_command2,
-            "expected command doesn't equal actual command"
-        );
-    }
-
-    #[test]
-    fn authenticate() {
-        let response = b"+ YmFy\r\n\
-                         a1 OK Logged in\r\n"
-            .to_vec();
-        let command = "a1 AUTHENTICATE PLAIN\r\n\
-                       Zm9v\r\n";
-        let mock_stream = MockStream::new(response);
-        let client = Client::new(mock_stream);
-        enum Authenticate {
-            Auth,
-        }
-        impl Authenticator for Authenticate {
-            type Response = Vec<u8>;
-            fn process(&self, challenge: &[u8]) -> Self::Response {
-                assert!(challenge == b"bar", "Invalid authenticate challenge");
-                b"foo".to_vec()
-            }
-        }
-        let session = client.authenticate("PLAIN", &Authenticate::Auth).unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == command.as_bytes().to_vec(),
-            "Invalid authenticate command"
-        );
-    }
-
-    #[test]
-    fn login() {
-        let response = b"a1 OK Logged in\r\n".to_vec();
-        let username = "username";
-        let password = "password";
-        let command = format!("a1 LOGIN {} {}\r\n", quote!(username), quote!(password));
-        let mock_stream = MockStream::new(response);
-        let client = Client::new(mock_stream);
-        let session = client.login(username, password).unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == command.as_bytes().to_vec(),
-            "Invalid login command"
-        );
-    }
-
-    #[test]
-    fn login_validation_username() {
-        let username = "username\n";
-        let password = "password";
-        assert_validation_error_client(
-            |client| client.login(username, password),
-            "LOGIN",
-            "username",
-            '\n',
-        );
-    }
-
-    #[test]
-    fn login_validation_password() {
-        let username = "username";
-        let password = "passw\rord";
-        assert_validation_error_client(
-            |client| client.login(username, password),
-            "LOGIN",
-            "password",
-            '\r',
-        );
-    }
-
-    #[test]
-    fn logout() {
-        let response = b"a1 OK Logout completed.\r\n".to_vec();
-        let command = format!("a1 LOGOUT\r\n");
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session.logout().unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == command.as_bytes().to_vec(),
-            "Invalid logout command"
-        );
-    }
-
-    #[test]
-    fn logout_with_untagged_bye() {
-        let response = b"* BYE Logging out\r\na1 OK Logout completed.\r\n".to_vec();
-        let command = format!("a1 LOGOUT\r\n");
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session.logout().unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == command.as_bytes().to_vec(),
-            "Invalid logout command"
-        );
-    }
-
-    #[test]
-    fn logout_with_tagged_bye() {
-        let response = b"a1 BYE IMAP4rev1 Server logging out\r\n".to_vec();
-        let command = format!("a1 LOGOUT\r\n");
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session.logout().unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == command.as_bytes().to_vec(),
-            "Invalid logout command"
-        );
-    }
-
-    #[test]
-    fn rename() {
-        let response = b"a1 OK RENAME completed\r\n".to_vec();
-        let current_mailbox_name = "INBOX";
-        let new_mailbox_name = "NEWINBOX";
-        let command = format!(
-            "a1 RENAME {} {}\r\n",
-            quote!(current_mailbox_name),
-            quote!(new_mailbox_name)
-        );
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session
-            .rename(current_mailbox_name, new_mailbox_name)
-            .unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == command.as_bytes().to_vec(),
-            "Invalid rename command"
-        );
-    }
-
-    #[test]
-    fn subscribe() {
-        let response = b"a1 OK SUBSCRIBE completed\r\n".to_vec();
-        let mailbox = "INBOX";
-        let command = format!("a1 SUBSCRIBE {}\r\n", quote!(mailbox));
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session.subscribe(mailbox).unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == command.as_bytes().to_vec(),
-            "Invalid subscribe command"
-        );
-    }
-
-    #[test]
-    fn unsubscribe() {
-        let response = b"a1 OK UNSUBSCRIBE completed\r\n".to_vec();
-        let mailbox = "INBOX";
-        let command = format!("a1 UNSUBSCRIBE {}\r\n", quote!(mailbox));
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session.unsubscribe(mailbox).unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == command.as_bytes().to_vec(),
-            "Invalid unsubscribe command"
-        );
-    }
-
-    #[test]
-    fn expunge() {
-        let response = b"a1 OK EXPUNGE completed\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session.expunge().unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == b"a1 EXPUNGE\r\n".to_vec(),
-            "Invalid expunge command"
-        );
-    }
-
-    #[test]
-    fn uid_expunge() {
-        let response = b"* 2 EXPUNGE\r\n\
-            * 3 EXPUNGE\r\n\
-            * 4 EXPUNGE\r\n\
-            a1 OK UID EXPUNGE completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session.uid_expunge("2:4").unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == b"a1 UID EXPUNGE 2:4\r\n".to_vec(),
-            "Invalid expunge command"
-        );
-    }
-
-    #[test]
-    fn check() {
-        let response = b"a1 OK CHECK completed\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session.check().unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == b"a1 CHECK\r\n".to_vec(),
-            "Invalid check command"
-        );
-    }
-
-    #[test]
-    fn examine() {
-        let response = b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
-            * OK [PERMANENTFLAGS ()] Read-only mailbox.\r\n\
-            * 1 EXISTS\r\n\
-            * 1 RECENT\r\n\
-            * OK [UNSEEN 1] First unseen.\r\n\
-            * OK [UIDVALIDITY 1257842737] UIDs valid\r\n\
-            * OK [UIDNEXT 2] Predicted next UID\r\n\
-            a1 OK [READ-ONLY] Select completed.\r\n"
-            .to_vec();
-        let expected_mailbox = Mailbox {
-            flags: vec![
-                Flag::Answered,
-                Flag::Flagged,
-                Flag::Deleted,
-                Flag::Seen,
-                Flag::Draft,
-            ],
-            exists: 1,
-            recent: 1,
-            unseen: Some(1),
-            permanent_flags: vec![],
-            uid_next: Some(2),
-            uid_validity: Some(1257842737),
-            highest_mod_seq: None,
-            is_read_only: true,
-        };
-        let mailbox_name = "INBOX";
-        let command = format!("a1 EXAMINE {}\r\n", quote!(mailbox_name));
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let mailbox = session.examine(mailbox_name).unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == command.as_bytes().to_vec(),
-            "Invalid examine command"
-        );
-        assert_eq!(mailbox, expected_mailbox);
-    }
-
-    #[test]
-    fn examine_validation() {
-        assert_validation_error_session(
-            |mut session| session.examine("INB\nOX"),
-            "EXAMINE",
-            "mailbox",
-            '\n',
-        )
-    }
-
-    #[test]
-    fn select() {
-        let response = b"* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n\
-            * OK [PERMANENTFLAGS (\\* \\Answered \\Flagged \\Deleted \\Draft \\Seen)] \
-              Read-only mailbox.\r\n\
-            * 1 EXISTS\r\n\
-            * 1 RECENT\r\n\
-            * OK [UNSEEN 1] First unseen.\r\n\
-            * OK [UIDVALIDITY 1257842737] UIDs valid\r\n\
-            * OK [UIDNEXT 2] Predicted next UID\r\n\
-            a1 OK [READ-ONLY] Select completed.\r\n"
-            .to_vec();
-        let expected_mailbox = Mailbox {
-            flags: vec![
-                Flag::Answered,
-                Flag::Flagged,
-                Flag::Deleted,
-                Flag::Seen,
-                Flag::Draft,
-            ],
-            exists: 1,
-            recent: 1,
-            unseen: Some(1),
-            permanent_flags: vec![
-                Flag::MayCreate,
-                Flag::Answered,
-                Flag::Flagged,
-                Flag::Deleted,
-                Flag::Draft,
-                Flag::Seen,
-            ],
-            uid_next: Some(2),
-            uid_validity: Some(1257842737),
-            highest_mod_seq: None,
-            is_read_only: true,
-        };
-        let mailbox_name = "INBOX";
-        let command = format!("a1 SELECT {}\r\n", quote!(mailbox_name));
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let mailbox = session.select(mailbox_name).unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == command.as_bytes().to_vec(),
-            "Invalid select command"
-        );
-        assert_eq!(mailbox, expected_mailbox);
-    }
-
-    #[test]
-    fn select_validation() {
-        assert_validation_error_session(
-            |mut session| session.select("INB\nOX"),
-            "SELECT",
-            "mailbox",
-            '\n',
-        )
-    }
-
-    #[test]
-    fn search() {
-        let response = b"* SEARCH 1 2 3 4 5\r\n\
-            a1 OK Search completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let ids = session.search("Unseen").unwrap();
-        let ids: HashSet<u32> = ids.iter().cloned().collect();
-        assert!(
-            session.stream.get_ref().written_buf == b"a1 SEARCH Unseen\r\n".to_vec(),
-            "Invalid search command"
-        );
-        assert_eq!(ids, [1, 2, 3, 4, 5].iter().cloned().collect());
-    }
-
-    #[test]
-    fn uid_search() {
-        let response = b"* SEARCH 1 2 3 4 5\r\n\
-            a1 OK Search completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let ids = session.uid_search("Unseen").unwrap();
-        let ids: HashSet<Uid> = ids.iter().cloned().collect();
-        assert!(
-            session.stream.get_ref().written_buf == b"a1 UID SEARCH Unseen\r\n".to_vec(),
-            "Invalid search command"
-        );
-        assert_eq!(ids, [1, 2, 3, 4, 5].iter().cloned().collect());
-    }
-
-    #[test]
-    fn sort() {
-        use extensions::sort::{SortCharset, SortCriterion};
-
-        let response = b"* SORT 1 2 3 4 5\r\n\
-            a1 OK Sort completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let ids = session
-            .sort(&[SortCriterion::Arrival], SortCharset::Utf8, "ALL")
-            .unwrap();
-        let ids: Vec<u32> = ids.iter().cloned().collect();
-        assert!(
-            session.stream.get_ref().written_buf == b"a1 SORT (ARRIVAL) UTF-8 ALL\r\n".to_vec(),
-            "Invalid sort command"
-        );
-        assert_eq!(ids, [1, 2, 3, 4, 5].iter().cloned().collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn uid_sort() {
-        use extensions::sort::{SortCharset, SortCriterion};
-
-        let response = b"* SORT 1 2 3 4 5\r\n\
-            a1 OK Sort completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let ids = session
-            .uid_sort(
-                &[SortCriterion::Reverse(&SortCriterion::Size)],
-                SortCharset::UsAscii,
-                "SUBJECT",
-            )
-            .unwrap();
-        let ids: Vec<Uid> = ids.iter().cloned().collect();
-        assert!(
-            session.stream.get_ref().written_buf
-                == b"a1 UID SORT (REVERSE SIZE) US-ASCII SUBJECT\r\n".to_vec(),
-            "Invalid sort command"
-        );
-        assert_eq!(ids, [1, 2, 3, 4, 5].iter().cloned().collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn set_acl_replace() {
-        let response = b"a1 OK completed\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session
-            .set_acl(
-                "INBOX",
-                "myuser",
-                &"x".try_into().unwrap(),
-                AclModifyMode::Replace,
-            )
-            .unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 SETACL \"INBOX\" \"myuser\" x\r\n".to_vec(),
-            "Invalid setacl command"
-        );
-    }
-
-    #[test]
-    fn set_acl_add() {
-        let response = b"a1 OK completed\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session
-            .set_acl(
-                "INBOX",
-                "myuser",
-                &"x".try_into().unwrap(),
-                AclModifyMode::Add,
-            )
-            .unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 SETACL \"INBOX\" \"myuser\" +x\r\n".to_vec(),
-            "Invalid setacl command"
-        );
-    }
-
-    #[test]
-    fn set_acl_remove() {
-        let response = b"a1 OK completed\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session
-            .set_acl(
-                "INBOX",
-                "myuser",
-                &"x".try_into().unwrap(),
-                AclModifyMode::Remove,
-            )
-            .unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 SETACL \"INBOX\" \"myuser\" -x\r\n".to_vec(),
-            "Invalid setacl command"
-        );
-    }
-
-    #[test]
-    fn delete_acl() {
-        let response = b"a1 OK completed\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session.delete_acl("INBOX", "myuser").unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 DELETEACL \"INBOX\" \"myuser\"\r\n".to_vec(),
-            "Invalid deleteacl command"
-        );
-    }
-
-    #[test]
-    fn get_acl() {
-        let response = b"* ACL INBOX myuser lr\r\n\
-            a1 OK completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let acl = session.get_acl("INBOX").unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 GETACL \"INBOX\"\r\n".to_vec(),
-            "Invalid getacl command"
-        );
-        assert_eq!(acl.parsed().mailbox(), "INBOX");
-        assert_eq!(
-            acl.parsed().acls(),
-            vec![AclEntry {
-                identifier: "myuser".into(),
-                rights: "lr".try_into().unwrap(),
-            }]
-        );
-    }
-
-    #[test]
-    fn get_acl_invalid_no_acl_lines() {
-        let response = b"a1 OK completed\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let acl = session.get_acl("INBOX");
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 GETACL \"INBOX\"\r\n".to_vec(),
-            "Invalid getacl command"
-        );
-        assert!(matches!(acl, Err(Error::Parse(_))));
-    }
-
-    #[test]
-    fn get_acl_invalid_too_many_acl_lines() {
-        let response = b"* ACL INBOX myuser lr\r\n\
-                * ACL INBOX myuser lr\r\n\
-                a1 OK completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let acl = session.get_acl("INBOX");
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 GETACL \"INBOX\"\r\n".to_vec(),
-            "Invalid getacl command"
-        );
-        assert!(matches!(acl, Err(Error::Parse(_))));
-    }
-
-    #[test]
-    fn get_acl_multiple_users() {
-        let response = b"* ACL INBOX myuser lr other_user lr\r\n\
-            a1 OK completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let acl = session.get_acl("INBOX").unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 GETACL \"INBOX\"\r\n".to_vec(),
-            "Invalid getacl command"
-        );
-        assert_eq!(acl.parsed().mailbox(), "INBOX");
-        assert_eq!(
-            acl.parsed().acls(),
-            vec![
-                AclEntry {
-                    identifier: "myuser".into(),
-                    rights: "lr".try_into().unwrap(),
-                },
-                AclEntry {
-                    identifier: "other_user".into(),
-                    rights: "lr".try_into().unwrap(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn list_rights() {
-        let response = b"* LISTRIGHTS INBOX myuser lr x k\r\n\
-            a1 OK completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let acl = session.list_rights("INBOX", "myuser").unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 LISTRIGHTS \"INBOX\" \"myuser\"\r\n".to_vec(),
-            "Invalid listrights command"
-        );
-        assert_eq!(acl.parsed().mailbox(), "INBOX");
-        assert_eq!(acl.parsed().identifier(), "myuser");
-        assert_eq!(*acl.parsed().required(), "lr".try_into().unwrap());
-        assert_eq!(*acl.parsed().optional(), "kx".try_into().unwrap());
-    }
-
-    #[test]
-    fn list_rights_invalid_no_rights_lines() {
-        let response = b"a1 OK completed\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let acl = session.list_rights("INBOX", "myuser");
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 LISTRIGHTS \"INBOX\" \"myuser\"\r\n".to_vec(),
-            "Invalid listrights command"
-        );
-        assert!(matches!(acl, Err(Error::Parse(_))));
-    }
-
-    #[test]
-    fn list_rights_invalid_too_many_rights_lines() {
-        let response = b"* LISTRIGHTS INBOX myuser lr x k\r\n\
-            * LISTRIGHTS INBOX myuser lr x k\r\n\
-            a1 OK completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let acl = session.list_rights("INBOX", "myuser");
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 LISTRIGHTS \"INBOX\" \"myuser\"\r\n".to_vec(),
-            "Invalid listrights command"
-        );
-        assert!(matches!(acl, Err(Error::Parse(_))));
-    }
-
-    #[test]
-    fn my_rights() {
-        let response = b"* MYRIGHTS INBOX lrxk\r\n\
-            a1 OK completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let acl = session.my_rights("INBOX").unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 MYRIGHTS \"INBOX\"\r\n".to_vec(),
-            "Invalid myrights command"
-        );
-        assert_eq!(acl.parsed().mailbox(), "INBOX");
-        assert_eq!(*acl.parsed().rights(), "lrkx".try_into().unwrap())
-    }
-
-    #[test]
-    fn my_rights_invalid_no_rights_lines() {
-        let response = b"a1 OK completed\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let acl = session.my_rights("INBOX");
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 MYRIGHTS \"INBOX\"\r\n".to_vec(),
-            "Invalid myrights command"
-        );
-        assert!(matches!(acl, Err(Error::Parse(_))));
-    }
-
-    #[test]
-    fn my_rights_invalid_too_many_rights_lines() {
-        let response = b"* MYRIGHTS INBOX lrxk\r\n\
-            * MYRIGHTS INBOX lrxk\r\n\
-            a1 OK completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let acl = session.my_rights("INBOX");
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 MYRIGHTS \"INBOX\"\r\n".to_vec(),
-            "Invalid myrights command"
-        );
-        assert!(matches!(acl, Err(Error::Parse(_))));
-    }
-
-    #[test]
-    fn set_quota() {
-        let response = b"* QUOTA my_root (STORAGE 10 500)\r\n\
-                a1 OK completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let quota = session
-            .set_quota(
-                "my_root",
-                &[QuotaResourceLimit {
-                    name: QuotaResourceName::Storage,
-                    amount: 500,
-                }],
-            )
-            .unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 SETQUOTA \"my_root\" (STORAGE 500)\r\n".to_vec(),
-            "Invalid setquota command"
-        );
-        let quota = quota.parsed().as_ref().unwrap();
-        assert_eq!(quota.root_name, "my_root");
-        assert_eq!(quota.resources.len(), 1);
-        assert_quota_resource(&quota.resources[0], QuotaResourceName::Storage, 500, 10);
-    }
-
-    #[test]
-    fn set_quota_via_quota_resource_limit_new() {
-        let response = b"* QUOTA my_root (STORAGE 10 500)\r\n\
-                a1 OK completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let quota = session
-            .set_quota("my_root", &[QuotaResourceLimit::new("STORAGE", 500)])
-            .unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 SETQUOTA \"my_root\" (STORAGE 500)\r\n".to_vec(),
-            "Invalid setquota command"
-        );
-        let quota = quota.parsed().as_ref().unwrap();
-        assert_eq!(quota.root_name, "my_root");
-        assert_eq!(quota.resources.len(), 1);
-        assert_quota_resource(&quota.resources[0], QuotaResourceName::Storage, 500, 10);
-    }
-
-    #[test]
-    fn set_quota_no_such_quota_root() {
-        let response = b"a1 NO no such quota root\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let quota = session.set_quota(
-            "my_root",
-            &[QuotaResourceLimit {
-                name: QuotaResourceName::Storage,
-                amount: 500,
-            }],
-        );
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 SETQUOTA \"my_root\" (STORAGE 500)\r\n".to_vec(),
-            "Invalid setquota command"
-        );
-        assert!(matches!(quota, Err(Error::No(_))));
-    }
-
-    #[test]
-    fn set_quota_invalid_no_quota_lines() {
-        let response = b"a1 OK completed\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let quota = session
-            .set_quota(
-                "my_root",
-                &[QuotaResourceLimit {
-                    name: QuotaResourceName::Storage,
-                    amount: 500,
-                }],
-            )
-            .unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 SETQUOTA \"my_root\" (STORAGE 500)\r\n".to_vec(),
-            "Invalid setquota command"
-        );
-        assert_eq!(quota.parsed(), &None);
-    }
-
-    #[test]
-    fn set_quota_invalid_too_many_quota_lines() {
-        let response = b"* QUOTA my_root (STORAGE 10 500)\r\n\
-                * QUOTA my_root2 (STORAGE 10 500)\r\n\
-                a1 OK completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let quota = session.set_quota(
-            "my_root",
-            &[QuotaResourceLimit {
-                name: QuotaResourceName::Storage,
-                amount: 500,
-            }],
-        );
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 SETQUOTA \"my_root\" (STORAGE 500)\r\n".to_vec(),
-            "Invalid setquota command"
-        );
-        assert!(matches!(quota, Err(Error::Parse(_))));
-    }
-
-    #[test]
-    fn get_quota() {
-        let response = b"* QUOTA my_root ()\r\n\
-            a1 OK completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let quota = session.get_quota("my_root").unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 GETQUOTA \"my_root\"\r\n".to_vec(),
-            "Invalid getquota command"
-        );
-        let quota = quota.parsed().as_ref().unwrap();
-        assert_eq!(quota.root_name, "my_root");
-        assert_eq!(quota.resources, vec![]);
-    }
-
-    #[test]
-    fn get_quota_with_limits() {
-        let response = b"* QUOTA my_root (STORAGE 10 500)\r
-a1 OK completed\r
-"
-        .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let quota = session.get_quota("my_root").unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 GETQUOTA \"my_root\"\r\n".to_vec(),
-            "Invalid getquota command"
-        );
-        let quota = quota.parsed().as_ref().unwrap();
-        assert_eq!(quota.root_name, "my_root");
-        assert_eq!(quota.resources.len(), 1);
-        assert_quota_resource(&quota.resources[0], QuotaResourceName::Storage, 500, 10);
-    }
-
-    #[test]
-    fn get_quota_with_invalid_no_quota_lines() {
-        let response = b"a1 OK completed\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let quota = session.get_quota("my_root").unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 GETQUOTA \"my_root\"\r\n".to_vec(),
-            "Invalid getquota command"
-        );
-        assert_eq!(quota.parsed(), &None);
-    }
-
-    #[test]
-    fn get_quota_with_invalid_too_many_quota_lines() {
-        let response = b"* QUOTA my_root (STORAGE 10 500)\r\n\
-                * QUOTA my_root2 (STORAGE 10 500)\r\n\
-                a1 OK completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let quota = session.get_quota("my_root");
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 GETQUOTA \"my_root\"\r\n".to_vec(),
-            "Invalid getquota command"
-        );
-        assert!(matches!(quota, Err(Error::Parse(_))));
-    }
-
-    #[test]
-    fn get_quota_with_no_such_quota_root() {
-        let response = b"a1 NO no such quota root\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let quota = session.get_quota("my_root");
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 GETQUOTA \"my_root\"\r\n".to_vec(),
-            "Invalid getquota command"
-        );
-        assert!(matches!(quota, Err(Error::No(_))));
-    }
-
-    #[test]
-    fn get_quota_root_with_no_root() {
-        let response = b"* QUOTAROOT INBOX\r\n\
-                a1 OK completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let quota_root = session.get_quota_root("INBOX").unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 GETQUOTAROOT \"INBOX\"\r\n".to_vec(),
-            "Invalid getquotaroot command"
-        );
-        assert_eq!(quota_root.mailbox_name(), "INBOX");
-        assert_eq!(
-            quota_root.quota_root_names().collect::<Vec<_>>(),
-            Vec::<&str>::new()
-        );
-        assert_eq!(quota_root.quotas(), vec![]);
-    }
-
-    #[test]
-    fn get_quota_root_no_such_mailbox() {
-        let response = b"a1 NO no such mailboxd\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let quota_root = session.get_quota_root("INBOX");
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 GETQUOTAROOT \"INBOX\"\r\n".to_vec(),
-            "Invalid getquotaroot command"
-        );
-        assert!(matches!(quota_root, Err(Error::No(_))));
-    }
-
-    #[test]
-    fn get_quota_root_invalid_no_quota_root_lines() {
-        let response = b"a1 OK completed\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let quota_root = session.get_quota_root("INBOX");
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 GETQUOTAROOT \"INBOX\"\r\n".to_vec(),
-            "Invalid getquotaroot command"
-        );
-        assert!(matches!(quota_root, Err(Error::Parse(_))));
-    }
-
-    #[test]
-    fn get_quota_root_invalid_too_many_quota_root_lines() {
-        let response = b"* QUOTAROOT INBOX\r\n\
-                * QUOTAROOT INBOX\r\n\
-                a1 OK completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let quota_root = session.get_quota_root("INBOX");
-        println!("Resp: {:?}", quota_root);
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 GETQUOTAROOT \"INBOX\"\r\n".to_vec(),
-            "Invalid getquotaroot command"
-        );
-        assert!(matches!(quota_root, Err(Error::Parse(_))));
-    }
-
-    #[test]
-    fn get_quota_root_with_root() {
-        let response = b"* QUOTAROOT INBOX my_root\r\n\
-                * QUOTA my_root (STORAGE 10 500)\r\n\
-                a1 OK completed\r\n"
-            .to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let quota_root = session.get_quota_root("INBOX").unwrap();
-        assert_eq!(
-            session.stream.get_ref().written_buf,
-            b"a1 GETQUOTAROOT \"INBOX\"\r\n".to_vec(),
-            "Invalid getquotaroot command"
-        );
-        assert_eq!(quota_root.mailbox_name(), "INBOX");
-        assert_eq!(
-            quota_root.quota_root_names().collect::<Vec<_>>(),
-            vec!["my_root"]
-        );
-        assert_eq!(quota_root.quotas().len(), 1);
-        assert_eq!(quota_root.quotas().first().unwrap().root_name, "my_root");
-        assert_eq!(
-            quota_root.quotas().first().unwrap().resources,
-            vec![QuotaResource {
-                name: QuotaResourceName::Storage,
-                usage: 10,
-                limit: 500,
-            }]
-        );
-    }
-
-    #[test]
-    fn capability() {
-        let response = b"* CAPABILITY IMAP4rev1 STARTTLS AUTH=GSSAPI LOGINDISABLED\r\n\
-            a1 OK CAPABILITY completed\r\n"
-            .to_vec();
-        let expected_capabilities = vec![
-            Capability::Imap4rev1,
-            Capability::Atom(Cow::Borrowed("STARTTLS")),
-            Capability::Auth(Cow::Borrowed("GSSAPI")),
-            Capability::Atom(Cow::Borrowed("LOGINDISABLED")),
-        ];
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        let capabilities = session.capabilities().unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == b"a1 CAPABILITY\r\n".to_vec(),
-            "Invalid capability command"
-        );
-        assert_eq!(capabilities.len(), 4);
-        for e in expected_capabilities {
-            assert!(capabilities.has(&e));
-        }
-    }
-
-    #[test]
-    fn create() {
-        let response = b"a1 OK CREATE completed\r\n".to_vec();
-        let mailbox_name = "INBOX";
-        let command = format!("a1 CREATE {}\r\n", quote!(mailbox_name));
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session.create(mailbox_name).unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == command.as_bytes().to_vec(),
-            "Invalid create command"
-        );
-    }
-
-    #[test]
-    fn create_validation() {
-        assert_validation_error_session(
-            |mut session| session.create("INB\nOX"),
-            "CREATE",
-            "mailbox",
-            '\n',
-        )
-    }
-
-    #[test]
-    fn delete() {
-        let response = b"a1 OK DELETE completed\r\n".to_vec();
-        let mailbox_name = "INBOX";
-        let command = format!("a1 DELETE {}\r\n", quote!(mailbox_name));
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session.delete(mailbox_name).unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == command.as_bytes().to_vec(),
-            "Invalid delete command"
-        );
-    }
-
-    #[test]
-    fn delete_validation() {
-        assert_validation_error_session(
-            |mut session| session.delete("INB\nOX"),
-            "DELETE",
-            "mailbox",
-            '\n',
-        )
-    }
-
-    #[test]
-    fn noop() {
-        let response = b"a1 OK NOOP completed\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session.noop().unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == b"a1 NOOP\r\n".to_vec(),
-            "Invalid noop command"
-        );
-    }
-
-    #[test]
-    fn close() {
-        let response = b"a1 OK CLOSE completed\r\n".to_vec();
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session.close().unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == b"a1 CLOSE\r\n".to_vec(),
-            "Invalid close command"
-        );
-    }
-
-    #[test]
-    fn store() {
-        generic_store(" ", |c, set, query| c.store(set, query));
-    }
-
-    #[test]
-    fn uid_store() {
-        generic_store(" UID ", |c, set, query| c.uid_store(set, query));
-    }
-
-    fn generic_store<F, T>(prefix: &str, op: F)
-    where
-        F: FnOnce(&mut Session<MockStream>, &str, &str) -> Result<T>,
-    {
-        let res = "* 2 FETCH (FLAGS (\\Deleted \\Seen))\r\n\
-                   * 3 FETCH (FLAGS (\\Deleted))\r\n\
-                   * 4 FETCH (FLAGS (\\Deleted \\Flagged \\Seen))\r\n\
-                   a1 OK STORE completed\r\n";
-
-        generic_with_uid(res, "STORE", "2.4", "+FLAGS (\\Deleted)", prefix, op);
-    }
-
-    #[test]
-    fn copy() {
-        generic_copy(" ", |c, set, query| c.copy(set, query))
-    }
-
-    #[test]
-    fn uid_copy() {
-        generic_copy(" UID ", |c, set, query| c.uid_copy(set, query))
-    }
-
-    fn generic_copy<F, T>(prefix: &str, op: F)
-    where
-        F: FnOnce(&mut Session<MockStream>, &str, &str) -> Result<T>,
-    {
-        generic_with_uid(
-            "OK COPY completed\r\n",
-            "COPY",
-            "2:4",
-            "MEETING",
-            prefix,
-            op,
-        );
-    }
-
-    #[test]
-    fn mv() {
-        let response = b"* OK [COPYUID 1511554416 142,399 41:42] Moved UIDs.\r\n\
-            * 2 EXPUNGE\r\n\
-            * 1 EXPUNGE\r\n\
-            a1 OK Move completed\r\n"
-            .to_vec();
-        let mailbox_name = "MEETING";
-        let command = format!("a1 MOVE 1:2 {}\r\n", quote!(mailbox_name));
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session.mv("1:2", mailbox_name).unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == command.as_bytes().to_vec(),
-            "Invalid move command"
-        );
-    }
-
-    #[test]
-    fn mv_validation_query() {
-        assert_validation_error_session(
-            |mut session| session.mv("1:2", "MEE\nTING"),
-            "MOVE",
-            "mailbox",
-            '\n',
-        )
-    }
-
-    #[test]
-    fn uid_mv() {
-        let response = b"* OK [COPYUID 1511554416 142,399 41:42] Moved UIDs.\r\n\
-            * 2 EXPUNGE\r\n\
-            * 1 EXPUNGE\r\n\
-            a1 OK Move completed\r\n"
-            .to_vec();
-        let mailbox_name = "MEETING";
-        let command = format!("a1 UID MOVE 41:42 {}\r\n", quote!(mailbox_name));
-        let mock_stream = MockStream::new(response);
-        let mut session = mock_session!(mock_stream);
-        session.uid_mv("41:42", mailbox_name).unwrap();
-        assert!(
-            session.stream.get_ref().written_buf == command.as_bytes().to_vec(),
-            "Invalid uid move command"
-        );
-    }
-
-    #[test]
-    fn uid_mv_validation_query() {
-        assert_validation_error_session(
-            |mut session| session.uid_mv("1:2", "MEE\nTING"),
-            "UID MOVE",
-            "mailbox",
-            '\n',
-        )
-    }
-
-    #[test]
-    fn fetch() {
-        generic_fetch(" ", |c, seq, query| c.fetch(seq, query))
-    }
-
-    #[test]
-    fn fetch_validation_seq() {
-        assert_validation_error_session(
-            |mut session| session.fetch("\r1", "BODY[]"),
-            "FETCH",
-            "seq",
-            '\r',
-        )
-    }
-
-    #[test]
-    fn fetch_validation_query() {
-        assert_validation_error_session(
-            |mut session| session.fetch("1", "BODY[\n]"),
-            "FETCH",
-            "query",
-            '\n',
-        )
-    }
-
-    #[test]
-    fn uid_fetch() {
-        generic_fetch(" UID ", |c, seq, query| c.uid_fetch(seq, query))
-    }
-
-    fn generic_fetch<F, T>(prefix: &str, op: F)
-    where
-        F: FnOnce(&mut Session<MockStream>, &str, &str) -> Result<T>,
-    {
-        generic_with_uid("OK FETCH completed\r\n", "FETCH", "1", "BODY[]", prefix, op);
-    }
-
-    fn generic_with_uid<F, T>(res: &str, cmd: &str, seq: &str, query: &str, prefix: &str, op: F)
-    where
-        F: FnOnce(&mut Session<MockStream>, &str, &str) -> Result<T>,
-    {
-        let resp = format!("a1 {}\r\n", res).as_bytes().to_vec();
-        let line = format!("a1{}{} {} {}\r\n", prefix, cmd, seq, query);
-        let mut session = mock_session!(MockStream::new(resp));
-        let _ = op(&mut session, seq, query);
-        assert!(
-            session.stream.get_ref().written_buf == line.as_bytes().to_vec(),
-            "Invalid command"
-        );
-    }
-
-    #[test]
-    fn uid_fetch_validation_seq() {
-        assert_validation_error_session(
-            |mut session| session.uid_fetch("\r1", "BODY[]"),
-            "UID FETCH",
-            "seq",
-            '\r',
-        )
-    }
-
-    #[test]
-    fn uid_fetch_validation_query() {
-        assert_validation_error_session(
-            |mut session| session.uid_fetch("1", "BODY[\n]"),
-            "UID FETCH",
-            "query",
-            '\n',
-        )
-    }
-
-    #[test]
-    fn status_validation_mailbox() {
-        assert_validation_error_session(
-            |mut session| session.status("IN\nBOX", "(MESSAGES)"),
-            "STATUS",
-            "mailbox",
-            '\n',
-        )
-    }
-
-    #[test]
-    fn quote_backslash() {
-        assert_eq!("\"test\\\\text\"", quote!(r"test\text"));
-    }
-
-    #[test]
-    fn quote_dquote() {
-        assert_eq!("\"test\\\"text\"", quote!("test\"text"));
-    }
-
-    #[test]
-    fn validate_random() {
-        assert_eq!(
-            "\"~iCQ_k;>[&\\\"sVCvUW`e<<P!wJ\"",
-            &validate_str("COMMAND", "arg1", "~iCQ_k;>[&\"sVCvUW`e<<P!wJ").unwrap()
-        );
-    }
-
-    #[test]
-    fn validate_newline() {
-        if let Err(ref e) = validate_str("COMMAND", "arg1", "test\nstring") {
-            if let &Error::Validate(ref ve) = e {
-                if ve.offending_char == '\n' {
-                    return;
-                }
-            }
-            panic!("Wrong error: {:?}", e);
-        }
-        panic!("No error");
-    }
-
-    #[test]
-    #[allow(unreachable_patterns)]
-    fn validate_carriage_return() {
-        if let Err(ref e) = validate_str("COMMAND", "arg1", "test\rstring") {
-            if let &Error::Validate(ref ve) = e {
-                if ve.offending_char == '\r' {
-                    return;
-                }
-            }
-            panic!("Wrong error: {:?}", e);
-        }
-        panic!("No error");
     }
 }

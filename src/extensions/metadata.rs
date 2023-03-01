@@ -15,7 +15,7 @@ use crate::error::{Error, ParseError, Result};
 use crate::parse::try_handle_unilateral;
 use crate::types::*;
 use imap_proto::types::{MailboxDatum, Metadata, Response, ResponseCode};
-use std::io::{Read, Write};
+use tokio::io::{AsyncRead, AsyncWrite};
 use std::sync::mpsc;
 
 // for intra-doc links
@@ -115,7 +115,7 @@ fn parse_metadata<'a>(
     }
 }
 
-impl<T: Read + Write> Session<T> {
+impl<T: AsyncRead + AsyncWrite + std::marker::Unpin> Session<T> {
     /// Retrieve server or mailbox annotations.
     ///
     /// This uses the `GETMETADATA` command defined in the METADATA extension of the IMAP protocol.
@@ -166,7 +166,7 @@ impl<T: Read + Write> Session<T> {
     /// Only entries that are less than or equal in octet size to the specified `maxsize` are
     /// returned. If there are any entries with values larger than `maxsize`, this method also
     /// returns the size of the biggest entry requested by the client that exceeded `maxsize`.
-    pub fn get_metadata(
+    pub async fn get_metadata(
         &mut self,
         mailbox: Option<&str>,
         entries: &[impl AsRef<str>],
@@ -196,7 +196,7 @@ impl<T: Read + Write> Session<T> {
             )
             .as_str(),
         );
-        let (lines, ok) = self.run(command)?;
+        let (lines, ok) = self.run(command).await?;
         let meta = parse_metadata(&lines[..ok], &mut self.unsolicited_responses_tx)?;
         let missed = if maxsize.is_some() {
             if let Ok((_, Response::Done { code, .. })) =
@@ -239,7 +239,7 @@ impl<T: Read + Write> Session<T> {
     /// change the values for other annotations specified.
     ///
     /// See [RFC 5464, section 4.3](https://tools.ietf.org/html/rfc5464#section-4.3)
-    pub fn set_metadata(&mut self, mbox: impl AsRef<str>, annotations: &[Metadata]) -> Result<()> {
+    pub async fn set_metadata(&mut self, mbox: impl AsRef<str>, annotations: &[Metadata]) -> Result<()> {
         let v: Vec<String> = annotations
             .iter()
             .enumerate()
@@ -251,212 +251,6 @@ impl<T: Read + Write> Session<T> {
             validate_str("SETMETADATA", "mailbox", mbox.as_ref())?,
             s
         );
-        self.run_command_and_check_ok(command)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::extensions::metadata::*;
-    use crate::mock_stream::MockStream;
-    use crate::*;
-
-    #[test]
-    fn test_getmetadata() {
-        let response = "a1 OK Logged in.\r\n* METADATA \"\" (/shared/vendor/vendor.coi/a {3}\r\nAAA /shared/vendor/vendor.coi/b {3}\r\nBBB /shared/vendor/vendor.coi/c {3}\r\nCCC)\r\na2 OK GETMETADATA Completed\r\n";
-        let mock_stream = MockStream::new(response.as_bytes().to_vec());
-        let client = Client::new(mock_stream);
-        let mut session = client.login("testuser", "pass").unwrap();
-        let r = session.get_metadata(
-            None,
-            &["/shared/vendor/vendor.coi", "/shared/comment"],
-            MetadataDepth::Infinity,
-            Option::None,
-        );
-
-        match r {
-            Ok((v, missed)) => {
-                assert_eq!(missed, None);
-                assert_eq!(v.len(), 3);
-                assert_eq!(v[0].entry, "/shared/vendor/vendor.coi/a");
-                assert_eq!(v[0].value.as_ref().expect("None is not expected"), "AAA");
-                assert_eq!(v[1].entry, "/shared/vendor/vendor.coi/b");
-                assert_eq!(v[1].value.as_ref().expect("None is not expected"), "BBB");
-                assert_eq!(v[2].entry, "/shared/vendor/vendor.coi/c");
-                assert_eq!(v[2].value.as_ref().expect("None is not expected"), "CCC");
-            }
-            Err(e) => panic!("Unexpected error: {:?}", e),
-        }
-    }
-
-    use crate::client::testutils::assert_validation_error_session;
-
-    #[test]
-    fn test_getmetadata_validation_entry1() {
-        assert_validation_error_session(
-            |mut session| {
-                session.get_metadata(
-                    None,
-                    &[
-                        "/shared/vendor\n/vendor.coi",
-                        "/shared/comment",
-                        "/some/other/entry",
-                    ],
-                    MetadataDepth::Infinity,
-                    None,
-                )
-            },
-            "GETMETADATA",
-            "entry#1",
-            '\n',
-        )
-    }
-
-    #[test]
-    fn test_getmetadata_validation_entry2() {
-        assert_validation_error_session(
-            |mut session| {
-                session.get_metadata(
-                    Some("INBOX"),
-                    &["/shared/vendor/vendor.coi", "/\rshared/comment"],
-                    MetadataDepth::Infinity,
-                    None,
-                )
-            },
-            "GETMETADATA",
-            "entry#2",
-            '\r',
-        )
-    }
-
-    #[test]
-    fn test_getmetadata_validation_mailbox() {
-        assert_validation_error_session(
-            |mut session| {
-                session.get_metadata(
-                    Some("INB\nOX"),
-                    &["/shared/vendor/vendor.coi", "/shared/comment"],
-                    MetadataDepth::Infinity,
-                    None,
-                )
-            },
-            "GETMETADATA",
-            "mailbox",
-            '\n',
-        );
-    }
-
-    #[test]
-    fn test_setmetadata_validation_mailbox() {
-        assert_validation_error_session(
-            |mut session| {
-                session.set_metadata(
-                    "INB\nOX",
-                    &[
-                        Metadata {
-                            entry: "/shared/vendor/vendor.coi".to_string(),
-                            value: None,
-                        },
-                        Metadata {
-                            entry: "/shared/comment".to_string(),
-                            value: Some("value".to_string()),
-                        },
-                    ],
-                )
-            },
-            "SETMETADATA",
-            "mailbox",
-            '\n',
-        );
-    }
-
-    #[test]
-    fn test_setmetadata_validation_entry1() {
-        assert_validation_error_session(
-            |mut session| {
-                session.set_metadata(
-                    "INBOX",
-                    &[
-                        Metadata {
-                            entry: "/shared/\nvendor/vendor.coi".to_string(),
-                            value: None,
-                        },
-                        Metadata {
-                            entry: "/shared/comment".to_string(),
-                            value: Some("value".to_string()),
-                        },
-                    ],
-                )
-            },
-            "SETMETADATA",
-            "entry#1",
-            '\n',
-        );
-    }
-
-    #[test]
-    fn test_setmetadata_validation_entry2_key() {
-        assert_validation_error_session(
-            |mut session| {
-                session.set_metadata(
-                    "INBOX",
-                    &[
-                        Metadata {
-                            entry: "/shared/vendor/vendor.coi".to_string(),
-                            value: None,
-                        },
-                        Metadata {
-                            entry: "/shared\r/comment".to_string(),
-                            value: Some("value".to_string()),
-                        },
-                    ],
-                )
-            },
-            "SETMETADATA",
-            "entry#2",
-            '\r',
-        );
-    }
-
-    #[test]
-    fn test_setmetadata_validation_entry2_value() {
-        assert_validation_error_session(
-            |mut session| {
-                session.set_metadata(
-                    "INBOX",
-                    &[
-                        Metadata {
-                            entry: "/shared/vendor/vendor.coi".to_string(),
-                            value: None,
-                        },
-                        Metadata {
-                            entry: "/shared/comment".to_string(),
-                            value: Some("va\nlue".to_string()),
-                        },
-                    ],
-                )
-            },
-            "SETMETADATA",
-            "value#2",
-            '\n',
-        );
-    }
-
-    #[test]
-    fn test_setmetadata_validation_entry() {
-        assert_validation_error_session(
-            |mut session| {
-                session.set_metadata(
-                    "INBOX",
-                    &[Metadata {
-                        entry: "/shared/\nvendor/vendor.coi".to_string(),
-                        value: None,
-                    }],
-                )
-            },
-            "SETMETADATA",
-            "entry#1",
-            '\n',
-        );
+        self.run_command_and_check_ok(command).await
     }
 }

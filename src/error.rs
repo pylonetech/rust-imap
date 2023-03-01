@@ -11,11 +11,9 @@ use base64::DecodeError;
 use bufstream::IntoInnerError as BufError;
 use imap_proto::{types::ResponseCode, Response};
 #[cfg(feature = "native-tls")]
-use native_tls::Error as TlsError;
+use tokio_native_tls::native_tls::Error as TlsError;
 #[cfg(feature = "native-tls")]
-use native_tls::HandshakeError as TlsHandshakeError;
-#[cfg(feature = "rustls-tls")]
-use rustls_connector::HandshakeError as RustlsHandshakeError;
+use tokio_native_tls::native_tls::HandshakeError as TlsHandshakeError;
 
 /// A convenience wrapper around `Result` for `imap::Error`.
 pub type Result<T> = result::Result<T, Error>;
@@ -73,9 +71,6 @@ impl fmt::Display for Bye {
 pub enum Error {
     /// An `io::Error` that occurred while trying to read or write to a network stream.
     Io(IoError),
-    /// An error from the `rustls` library during the TLS handshake.
-    #[cfg(feature = "rustls-tls")]
-    RustlsHandshake(RustlsHandshakeError<TcpStream>),
     /// An error from the `native_tls` library during the TLS handshake.
     #[cfg(feature = "native-tls")]
     TlsHandshake(TlsHandshakeError<TcpStream>),
@@ -124,13 +119,6 @@ impl<T> From<BufError<T>> for Error {
     }
 }
 
-#[cfg(feature = "rustls-tls")]
-impl From<RustlsHandshakeError<TcpStream>> for Error {
-    fn from(err: RustlsHandshakeError<TcpStream>) -> Error {
-        Error::RustlsHandshake(err)
-    }
-}
-
 #[cfg(feature = "native-tls")]
 impl From<TlsHandshakeError<TcpStream>> for Error {
     fn from(err: TlsHandshakeError<TcpStream>) -> Error {
@@ -155,8 +143,6 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Error::Io(ref e) => fmt::Display::fmt(e, f),
-            #[cfg(feature = "rustls-tls")]
-            Error::RustlsHandshake(ref e) => fmt::Display::fmt(e, f),
             #[cfg(feature = "native-tls")]
             Error::Tls(ref e) => fmt::Display::fmt(e, f),
             #[cfg(feature = "native-tls")]
@@ -179,8 +165,6 @@ impl StdError for Error {
     fn description(&self) -> &str {
         match *self {
             Error::Io(ref e) => e.description(),
-            #[cfg(feature = "rustls-tls")]
-            Error::RustlsHandshake(ref e) => e.description(),
             #[cfg(feature = "native-tls")]
             Error::Tls(ref e) => e.description(),
             #[cfg(feature = "native-tls")]
@@ -200,8 +184,6 @@ impl StdError for Error {
     fn cause(&self) -> Option<&dyn StdError> {
         match *self {
             Error::Io(ref e) => Some(e),
-            #[cfg(feature = "rustls-tls")]
-            Error::RustlsHandshake(ref e) => Some(e),
             #[cfg(feature = "native-tls")]
             Error::Tls(ref e) => Some(e),
             #[cfg(feature = "native-tls")]

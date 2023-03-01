@@ -1,11 +1,10 @@
+use std::future::Future;
+
 use crate::{Client, Result};
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use tokio::{io::{AsyncRead, AsyncWrite}, net::TcpStream};
 
 #[cfg(feature = "native-tls")]
-use native_tls::{TlsConnector, TlsStream};
-#[cfg(feature = "rustls-tls")]
-use rustls_connector::{RustlsConnector, TlsStream as RustlsStream};
+use tokio_native_tls::{TlsConnector, TlsStream};
 
 /// A convenience builder for [`Client`] structs over various encrypted transports.
 ///
@@ -19,45 +18,18 @@ use rustls_connector::{RustlsConnector, TlsStream as RustlsStream};
 /// # }
 /// ```
 ///
-/// Similarly, if using the `rustls-tls` feature you can create a [`Client`] using rustls:
-/// ```no_run
-/// # use imap::ClientBuilder;
-/// # {} #[cfg(feature = "rustls-tls")]
-/// # fn main() -> Result<(), imap::Error> {
-/// let client = ClientBuilder::new("imap.example.com", 993).rustls()?;
-/// # Ok(())
-/// # }
-/// ```
-///
-/// To use `STARTTLS`, just call `starttls()` before one of the [`Client`]-yielding
-/// functions:
-/// ```no_run
-/// # use imap::ClientBuilder;
-/// # {} #[cfg(feature = "rustls-tls")]
-/// # fn main() -> Result<(), imap::Error> {
-/// let client = ClientBuilder::new("imap.example.com", 993)
-///     .starttls()
-///     .rustls()?;
-/// # Ok(())
-/// # }
-/// ```
 /// The returned [`Client`] is unauthenticated; to access session-related methods (through
 /// [`Session`](crate::Session)), use [`Client::login`] or [`Client::authenticate`].
-pub struct ClientBuilder<D>
-where
-    D: AsRef<str>,
-{
-    domain: D,
+pub struct ClientBuilder {
+    domain: String,
     port: u16,
     starttls: bool,
 }
 
-impl<D> ClientBuilder<D>
-where
-    D: AsRef<str>,
+impl ClientBuilder
 {
     /// Make a new `ClientBuilder` using the given domain and port.
-    pub fn new(domain: D, port: u16) -> Self {
+    pub fn new(domain: String, port: u16) -> Self {
         ClientBuilder {
             domain,
             port,
@@ -66,7 +38,7 @@ where
     }
 
     /// Use [`STARTTLS`](https://tools.ietf.org/html/rfc2595) for this connection.
-    #[cfg(any(feature = "native-tls", feature = "rustls-tls"))]
+    #[cfg(feature = "native-tls")]
     pub fn starttls(&mut self) -> &mut Self {
         self.starttls = true;
         self
@@ -75,21 +47,11 @@ where
     /// Return a new [`Client`] using a `native-tls` transport.
     #[cfg(feature = "native-tls")]
     #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
-    pub fn native_tls(&mut self) -> Result<Client<TlsStream<TcpStream>>> {
-        self.connect(|domain, tcp| {
-            let ssl_conn = TlsConnector::builder().build()?;
-            Ok(TlsConnector::connect(&ssl_conn, domain, tcp)?)
-        })
-    }
-
-    /// Return a new [`Client`] using `rustls` transport.
-    #[cfg(feature = "rustls-tls")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
-    pub fn rustls(&mut self) -> Result<Client<RustlsStream<TcpStream>>> {
-        self.connect(|domain, tcp| {
-            let ssl_conn = RustlsConnector::new_with_native_certs()?;
-            Ok(ssl_conn.connect(domain, tcp)?)
-        })
+    pub async fn native_tls(&mut self) -> Result<Client<TlsStream<TcpStream>>> {
+        self.connect(async move |domain, tcp| {
+            let ssl_conn: TlsConnector = tokio_native_tls::native_tls::TlsConnector::builder().build()?.into();
+            Ok(TlsConnector::connect(&ssl_conn, &domain, tcp).await?)
+        }).await
     }
 
     /// Make a [`Client`] using a custom TLS initialization. This function is intended
@@ -101,7 +63,7 @@ where
     /// - domain: [`&str`]
     /// - tcp: [`TcpStream`]
     ///
-    /// and yield a `Result<C>` where `C` is `Read + Write`. It should only perform
+    /// and yield a `Result<C>` where `C` is `AsyncRead + AsyncWrite`. It should only perform
     /// TLS initialization over the given `tcp` socket and return the encrypted stream
     /// object, such as a [`native_tls::TlsStream`] or a [`rustls_connector::TlsStream`].
     ///
@@ -109,40 +71,27 @@ where
     /// then the `tcp` socket given to the `handshake` function will be connected and will
     /// have initiated the `STARTTLS` handshake.
     ///
-    /// ```no_run
-    /// # use imap::ClientBuilder;
-    /// # use rustls_connector::RustlsConnector;
-    /// # {} #[cfg(feature = "rustls-tls")]
-    /// # fn main() -> Result<(), imap::Error> {
-    /// let client = ClientBuilder::new("imap.example.com", 993)
-    ///     .starttls()
-    ///     .connect(|domain, tcp| {
-    ///         let ssl_conn = RustlsConnector::new_with_native_certs()?;
-    ///         Ok(ssl_conn.connect(domain, tcp)?)
-    ///     })?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn connect<F, C>(&mut self, handshake: F) -> Result<Client<C>>
+    pub async fn connect<Fut, F, C>(&mut self, handshake: F) -> Result<Client<C>>
     where
-        F: FnOnce(&str, TcpStream) -> Result<C>,
-        C: Read + Write,
+        C: AsyncRead + AsyncWrite + std::marker::Unpin,
+        Fut: Future<Output = Result<C>>,
+        F: FnOnce(String, TcpStream) -> Fut,
     {
         let tcp = if self.starttls {
-            let tcp = TcpStream::connect((self.domain.as_ref(), self.port))?;
+            let tcp = TcpStream::connect((self.domain.as_ref(), self.port)).await?;
             let mut client = Client::new(tcp);
-            client.read_greeting()?;
-            client.run_command_and_check_ok("STARTTLS")?;
+            client.read_greeting().await?;
+            client.run_command_and_check_ok("STARTTLS").await?;
             client.into_inner()?
         } else {
-            TcpStream::connect((self.domain.as_ref(), self.port))?
+            TcpStream::connect((self.domain.as_ref(), self.port)).await?
         };
 
-        let tls = handshake(self.domain.as_ref(), tcp)?;
+        let tls = handshake(self.domain.clone(), tcp).await?;
 
         let mut client = Client::new(tls);
         if !self.starttls {
-            client.read_greeting()?;
+            client.read_greeting().await?;
         }
 
         Ok(client)

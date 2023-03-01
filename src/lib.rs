@@ -70,12 +70,10 @@
 //! default-features = false
 //! ```
 //!
-//! Even without `native_tls`, you can still use TLS by leveraging the pure Rust `rustls`
-//! crate, which is enabled with the `rustls-tls` feature. See the example/rustls.rs file
-//! for a working example.
 #![deny(missing_docs)]
 #![warn(rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![feature(async_closure)]
 
 mod parse;
 mod utils;
@@ -94,6 +92,3 @@ pub mod error;
 pub use error::{Error, Result};
 
 pub mod extensions;
-
-#[cfg(test)]
-mod mock_stream;

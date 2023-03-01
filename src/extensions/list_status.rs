@@ -7,7 +7,7 @@ use crate::parse::try_handle_unilateral;
 use crate::types::{Mailbox, Name, UnsolicitedResponse};
 use imap_proto::types::{MailboxDatum, Response, StatusAttribute};
 use ouroboros::self_referencing;
-use std::io::{Read, Write};
+use tokio::io::{AsyncRead, AsyncWrite};
 use std::slice::Iter;
 use std::sync::mpsc;
 
@@ -125,7 +125,7 @@ impl ExtendedNames {
     }
 }
 
-impl<T: Read + Write> Session<T> {
+impl<T: AsyncRead + AsyncWrite + std::marker::Unpin> Session<T> {
     /// The [extended `LIST` command](https://tools.ietf.org/html/rfc5819.html#section-2) returns
     /// a subset of names from the complete set of all names available to the client. Each name
     /// _should_ be paired with a STATUS response, though the server _may_ drop it if it encounters
@@ -138,7 +138,7 @@ impl<T: Read + Write> Session<T> {
     /// [`Session::list`].
     ///
     /// The `data_items` argument has the same semantics as it does in [`Session::status`].
-    pub fn list_status(
+    pub async fn list_status(
         &mut self,
         reference_name: Option<&str>,
         mailbox_pattern: Option<&str>,
@@ -151,6 +151,7 @@ impl<T: Read + Write> Session<T> {
             mailbox_pattern.unwrap_or("\"\""),
             data_items
         ))
+        .await
         .and_then(|lines| ExtendedNames::parse(lines, &mut self.unsolicited_responses_tx))
     }
 }

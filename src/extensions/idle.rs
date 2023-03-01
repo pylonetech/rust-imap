@@ -5,13 +5,9 @@ use crate::client::Session;
 use crate::error::{Error, Result};
 use crate::parse::parse_idle;
 use crate::types::UnsolicitedResponse;
-#[cfg(feature = "native-tls")]
-use native_tls::TlsStream;
-#[cfg(feature = "rustls-tls")]
-use rustls_connector::TlsStream as RustlsStream;
-use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use tokio::{io::{AsyncRead, AsyncWrite}};
 use std::time::Duration;
+use async_recursion::async_recursion;
 
 /// `Handle` allows a client to block waiting for changes to the remote mailbox.
 ///
@@ -52,9 +48,8 @@ use std::time::Duration;
 ///
 /// As long as a [`Handle`] is active, the mailbox cannot be otherwise accessed.
 #[derive(Debug)]
-pub struct Handle<'a, T: Read + Write> {
+pub struct Handle<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin> {
     session: &'a mut Session<T>,
-    timeout: Duration,
     keepalive: bool,
     done: bool,
 }
@@ -83,43 +78,42 @@ pub trait SetReadTimeout {
     fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()>;
 }
 
-impl<'a, T: Read + Write + 'a> Handle<'a, T> {
+impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Handle<'a, T> {
     pub(crate) fn make(session: &'a mut Session<T>) -> Self {
         Handle {
             session,
-            timeout: Duration::from_secs(29 * 60),
             keepalive: true,
             done: false,
         }
     }
 
-    fn init(&mut self) -> Result<()> {
+    async fn init(&mut self) -> Result<()> {
         // https://tools.ietf.org/html/rfc2177
         //
         // The IDLE command takes no arguments.
-        self.session.run_command("IDLE")?;
+        self.session.run_command("IDLE").await?;
 
         // A tagged response will be sent either
         //
         //   a) if there's an error, or
         //   b) *after* we send DONE
         let mut v = Vec::new();
-        self.session.readline(&mut v)?;
+        self.session.readline(&mut v).await?;
         if v.starts_with(b"+") {
             self.done = false;
             return Ok(());
         }
 
-        self.session.read_response_onto(&mut v)?;
+        self.session.read_response_onto(&mut v).await?;
         // We should *only* get a continuation on an error (i.e., it gives BAD or NO).
         unreachable!();
     }
 
-    fn terminate(&mut self) -> Result<()> {
+    async fn terminate(&mut self) -> Result<()> {
         if !self.done {
             self.done = true;
-            self.session.write_line(b"DONE")?;
-            self.session.read_response().map(|_| ())
+            self.session.write_line(b"DONE").await?;
+            self.session.read_response().await.map(|_| ())
         } else {
             Ok(())
         }
@@ -128,16 +122,17 @@ impl<'a, T: Read + Write + 'a> Handle<'a, T> {
     /// Internal helper that doesn't consume self.
     ///
     /// This is necessary so that we can keep using the inner `Session` in `wait_while`.
-    fn wait_inner<F>(&mut self, reconnect: bool, mut callback: F) -> Result<WaitOutcome>
+    #[async_recursion(?Send)]
+    async fn wait_inner<F>(&mut self, reconnect: bool, mut callback: F) -> Result<WaitOutcome>
     where
         F: FnMut(UnsolicitedResponse) -> bool,
     {
         let mut v = Vec::new();
         let result = loop {
-            match self.session.readline(&mut v) {
+            match self.session.readline(&mut v).await {
                 Err(Error::Io(ref e))
-                    if e.kind() == io::ErrorKind::TimedOut
-                        || e.kind() == io::ErrorKind::WouldBlock =>
+                    if e.kind() == std::io::ErrorKind::TimedOut
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
                 {
                     break Ok(WaitOutcome::TimedOut);
                 }
@@ -184,23 +179,12 @@ impl<'a, T: Read + Write + 'a> Handle<'a, T> {
         // Reconnect on timeout if needed
         match (reconnect, result) {
             (true, Ok(WaitOutcome::TimedOut)) => {
-                self.terminate()?;
-                self.init()?;
-                self.wait_inner(reconnect, callback)
+                self.terminate().await?;
+                self.init().await?;
+                self.wait_inner(reconnect, callback).await
             }
             (_, result) => result,
         }
-    }
-}
-
-impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
-    /// Set the timeout duration on the connection. This will also set the frequency
-    /// at which the connection is refreshed.
-    ///
-    /// The interval defaults to 29 minutes as given in RFC 2177.
-    pub fn timeout(&mut self, interval: Duration) -> &mut Self {
-        self.timeout = interval;
-        self
     }
 
     /// Do not continuously refresh the IDLE connection in the background.
@@ -216,11 +200,11 @@ impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
 
     /// Block until the given callback returns `false`, or until a response
     /// arrives that is not explicitly handled by [`UnsolicitedResponse`].
-    pub fn wait_while<F>(&mut self, callback: F) -> Result<WaitOutcome>
+    pub async fn wait_while<F>(&mut self, callback: F) -> Result<WaitOutcome>
     where
         F: FnMut(UnsolicitedResponse) -> bool,
     {
-        self.init()?;
+        self.init().await?;
         // The server MAY consider a client inactive if it has an IDLE command
         // running, and if such a server has an inactivity timeout it MAY log
         // the client off implicitly at the end of its timeout period.  Because
@@ -228,39 +212,14 @@ impl<'a, T: SetReadTimeout + Read + Write + 'a> Handle<'a, T> {
         // re-issue it at least every 29 minutes to avoid being logged off.
         // This still allows a client to receive immediate mailbox updates even
         // though it need only "poll" at half hour intervals.
-        self.session
-            .stream
-            .get_mut()
-            .set_read_timeout(Some(self.timeout))?;
-        let res = self.wait_inner(self.keepalive, callback);
-        let _ = self.session.stream.get_mut().set_read_timeout(None).is_ok();
+        // TODO
+        let res = self.wait_inner(self.keepalive, callback).await;
         res
     }
 }
 
-impl<'a, T: Read + Write + 'a> Drop for Handle<'a, T> {
+impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Drop for Handle<'a, T> {
     fn drop(&mut self) {
-        // we don't want to panic here if we can't terminate the Idle
-        let _ = self.terminate().is_ok();
-    }
-}
-
-impl<'a> SetReadTimeout for TcpStream {
-    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
-        TcpStream::set_read_timeout(self, timeout).map_err(Error::Io)
-    }
-}
-
-#[cfg(feature = "native-tls")]
-impl<'a> SetReadTimeout for TlsStream<TcpStream> {
-    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
-        self.get_ref().set_read_timeout(timeout).map_err(Error::Io)
-    }
-}
-
-#[cfg(feature = "rustls-tls")]
-impl<'a> SetReadTimeout for RustlsStream<TcpStream> {
-    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
-        self.get_ref().set_read_timeout(timeout).map_err(Error::Io)
+        let _ = futures::executor::block_on(self.terminate()).is_ok();
     }
 }
