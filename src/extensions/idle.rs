@@ -50,7 +50,6 @@ use async_recursion::async_recursion;
 #[derive(Debug)]
 pub struct Handle<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin> {
     session: &'a mut Session<T>,
-    keepalive: bool,
     done: bool,
 }
 
@@ -82,7 +81,6 @@ impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Handle<'a, T> {
     pub(crate) fn make(session: &'a mut Session<T>) -> Self {
         Handle {
             session,
-            keepalive: true,
             done: false,
         }
     }
@@ -122,20 +120,13 @@ impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Handle<'a, T> {
     /// Internal helper that doesn't consume self.
     ///
     /// This is necessary so that we can keep using the inner `Session` in `wait_while`.
-    #[async_recursion(?Send)]
-    async fn wait_inner<F>(&mut self, reconnect: bool, mut callback: F) -> Result<WaitOutcome>
+    async fn wait_inner<F>(&mut self, mut callback: F) -> Result<WaitOutcome>
     where
         F: FnMut(UnsolicitedResponse) -> bool,
     {
         let mut v = Vec::new();
         let result = loop {
             match self.session.readline(&mut v).await {
-                Err(Error::Io(ref e))
-                    if e.kind() == std::io::ErrorKind::TimedOut
-                        || e.kind() == std::io::ErrorKind::WouldBlock =>
-                {
-                    break Ok(WaitOutcome::TimedOut);
-                }
                 Ok(_len) => {
                     //  Handle Dovecot's imap_idle_notify_interval message
                     if v.eq_ignore_ascii_case(b"* OK Still here\r\n") {
@@ -176,28 +167,9 @@ impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Handle<'a, T> {
             };
         };
 
-        // Reconnect on timeout if needed
-        match (reconnect, result) {
-            (true, Ok(WaitOutcome::TimedOut)) => {
-                self.terminate().await?;
-                self.init().await?;
-                self.wait_inner(reconnect, callback).await
-            }
-            (_, result) => result,
-        }
+        result
     }
-
-    /// Do not continuously refresh the IDLE connection in the background.
-    ///
-    /// By default, connections will periodically be refreshed in the background using the
-    /// timeout duration set by [`Handle::timeout`]. If you do not want this behaviour, call
-    /// this function and the connection will simply IDLE until `wait_while` returns or
-    /// the timeout expires.
-    pub fn keepalive(&mut self, keepalive: bool) -> &mut Self {
-        self.keepalive = keepalive;
-        self
-    }
-
+    
     /// Block until the given callback returns `false`, or until a response
     /// arrives that is not explicitly handled by [`UnsolicitedResponse`].
     pub async fn wait_while<F>(&mut self, callback: F) -> Result<WaitOutcome>
@@ -213,7 +185,7 @@ impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Handle<'a, T> {
         // This still allows a client to receive immediate mailbox updates even
         // though it need only "poll" at half hour intervals.
         // TODO
-        let res = self.wait_inner(self.keepalive, callback).await;
+        let res = self.wait_inner(callback).await;
         res
     }
 }
