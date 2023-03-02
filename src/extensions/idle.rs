@@ -5,7 +5,7 @@ use crate::client::Session;
 use crate::error::Result;
 use crate::parse::parse_idle;
 use crate::types::UnsolicitedResponse;
-use tokio::{io::{AsyncRead, AsyncWrite}};
+use tokio::{io::{AsyncRead, AsyncWrite}, sync::{mpsc::{UnboundedReceiver, UnboundedSender}, oneshot}};
 use std::time::Duration;
 
 /// `Handle` allows a client to block waiting for changes to the remote mailbox.
@@ -119,61 +119,76 @@ impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Handle<'a, T> {
     /// Internal helper that doesn't consume self.
     ///
     /// This is necessary so that we can keep using the inner `Session` in `wait_while`.
-    async fn wait_inner<F>(&mut self, mut callback: F) -> Result<WaitOutcome>
-    where
-        F: FnMut(UnsolicitedResponse) -> bool,
+    async fn wait_inner(
+        &mut self,
+        mut cmd_rx: UnboundedReceiver<()>,
+        cmd_tx: UnboundedSender<()>,
+        idle_tx: UnboundedSender<UnsolicitedResponse>,
+        mut kill_rx: oneshot::Receiver<()>,
+    ) -> Result<()>
     {
         let mut v = Vec::new();
-        let result = loop {
-            match self.session.readline(&mut v).await {
-                Ok(_len) => {
-                    //  Handle Dovecot's imap_idle_notify_interval message
-                    if v.eq_ignore_ascii_case(b"* OK Still here\r\n") {
-                        v.clear();
-                        continue;
-                    }
-                    match parse_idle(&v) {
-                        // Something went wrong parsing.
-                        (_rest, Some(Err(r))) => break Err(r),
-                        // Complete response. We expect rest to be empty.
-                        (rest, Some(Ok(response))) => {
-                            if !callback(response) {
-                                break Ok(WaitOutcome::MailboxChanged);
-                            }
 
-                            // Assert on partial parse in debug builds - we expect
-                            // to always parse all or none of the input buffer.
-                            // On release builds, we still do the right thing.
-                            debug_assert!(
-                                rest.is_empty(),
-                                "Unexpected partial parse: input: {:?}, output: {:?}",
-                                v,
-                                rest,
-                            );
-
-                            if rest.is_empty() {
-                                v.clear();
-                            } else {
-                                let used = v.len() - rest.len();
-                                v.drain(0..used);
-                            }
+        let res = loop {
+            tokio::select! {
+                _ = &mut kill_rx => {
+                    break Ok(());
+                },
+                cmd = cmd_rx.recv() => {
+                    cmd_tx.send(cmd.unwrap()).unwrap();
+                },
+                x = self.session.readline(&mut v) => match x {
+                    Ok(_len) => {
+                        //  Handle Dovecot's imap_idle_notify_interval message
+                        if v.eq_ignore_ascii_case(b"* OK Still here\r\n") {
+                            v.clear();
+                            continue;
                         }
-                        // Incomplete parse - do nothing and read more.
-                        (_rest, None) => {}
+                        match parse_idle(&v) {
+                            // Something went wrong parsing.
+                            (_rest, Some(Err(r))) => break Err(r),
+                            // Complete response. We expect rest to be empty.
+                            (rest, Some(Ok(response))) => {
+                                idle_tx.send(response).unwrap();
+    
+                                // Assert on partial parse in debug builds - we expect
+                                // to always parse all or none of the input buffer.
+                                // On release builds, we still do the right thing.
+                                debug_assert!(
+                                    rest.is_empty(),
+                                    "Unexpected partial parse: input: {:?}, output: {:?}",
+                                    v,
+                                    rest,
+                                );
+    
+                                if rest.is_empty() {
+                                    v.clear();
+                                } else {
+                                    let used = v.len() - rest.len();
+                                    v.drain(0..used);
+                                }
+                            }
+                            // Incomplete parse - do nothing and read more.
+                            (_rest, None) => {}
+                        }
                     }
-                }
-                Err(r) => break Err(r),
-            };
+                    Err(r) => break Err(r),
+                },
+            }
         };
 
-        result
+        res
     }
     
     /// Block until the given callback returns `false`, or until a response
     /// arrives that is not explicitly handled by [`UnsolicitedResponse`].
-    pub async fn wait_while<F>(&mut self, callback: F) -> Result<WaitOutcome>
-    where
-        F: FnMut(UnsolicitedResponse) -> bool,
+    pub async fn wait_while(
+        &mut self,
+        cmd_rx: UnboundedReceiver<()>,
+        cmd_tx: UnboundedSender<()>,
+        idle_tx: UnboundedSender<UnsolicitedResponse>,
+        kill_rx: oneshot::Receiver<()>,
+    ) -> Result<()>
     {
         self.init().await?;
         // The server MAY consider a client inactive if it has an IDLE command
@@ -184,7 +199,12 @@ impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Handle<'a, T> {
         // This still allows a client to receive immediate mailbox updates even
         // though it need only "poll" at half hour intervals.
         // TODO
-        let res = self.wait_inner(callback).await;
+        let res = self.wait_inner(
+            cmd_rx,
+            cmd_tx,
+            idle_tx,
+            kill_rx,
+        ).await;
         self.terminate().await.unwrap();
         res
     }

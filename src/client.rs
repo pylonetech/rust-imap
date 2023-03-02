@@ -1520,7 +1520,7 @@ impl<T: AsyncRead + AsyncWrite + std::marker::Unpin> Connection<T> {
         self.read_response().await
     }
 
-    pub(crate) async fn read_response(&mut self) -> Result<(Vec<u8>, usize)> {
+    pub async fn read_response(&mut self) -> Result<(Vec<u8>, usize)> {
         let mut v = Vec::new();
         let ok = self.read_response_onto(&mut v).await?;
         Ok((v, ok))
@@ -1635,7 +1635,7 @@ impl<T: AsyncRead + AsyncWrite + std::marker::Unpin> Connection<T> {
         format!("{}{} {}", TAG_PREFIX, self.tag, command)
     }
 
-    pub(crate) async fn write_line(&mut self, buf: &[u8]) -> Result<()> {
+    pub async fn write_line(&mut self, buf: &[u8]) -> Result<()> {
         self.stream.write_all(buf).await?;
         self.stream.write_all(&[CR, LF]).await?;
         self.stream.flush().await?;
