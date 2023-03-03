@@ -5,7 +5,7 @@ use crate::client::Session;
 use crate::error::Result;
 use crate::parse::parse_idle;
 use crate::types::UnsolicitedResponse;
-use tokio::{io::{AsyncRead, AsyncWrite}, sync::{mpsc::{UnboundedReceiver, UnboundedSender}, oneshot}};
+use tokio::{io::{AsyncRead, AsyncWrite}, sync::{mpsc::UnboundedSender, oneshot}};
 use std::time::Duration;
 
 /// `Handle` allows a client to block waiting for changes to the remote mailbox.
@@ -121,8 +121,6 @@ impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Handle<'a, T> {
     /// This is necessary so that we can keep using the inner `Session` in `wait_while`.
     async fn wait_inner(
         &mut self,
-        mut cmd_rx: UnboundedReceiver<()>,
-        cmd_tx: UnboundedSender<()>,
         idle_tx: UnboundedSender<UnsolicitedResponse>,
         mut kill_rx: oneshot::Receiver<()>,
     ) -> Result<()>
@@ -133,9 +131,6 @@ impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Handle<'a, T> {
             tokio::select! {
                 _ = &mut kill_rx => {
                     break Ok(());
-                },
-                cmd = cmd_rx.recv() => {
-                    cmd_tx.send(cmd.unwrap()).unwrap();
                 },
                 x = self.session.readline(&mut v) => match x {
                     Ok(_len) => {
@@ -184,8 +179,6 @@ impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Handle<'a, T> {
     /// arrives that is not explicitly handled by [`UnsolicitedResponse`].
     pub async fn wait_while(
         &mut self,
-        cmd_rx: UnboundedReceiver<()>,
-        cmd_tx: UnboundedSender<()>,
         idle_tx: UnboundedSender<UnsolicitedResponse>,
         kill_rx: oneshot::Receiver<()>,
     ) -> Result<()>
@@ -200,8 +193,6 @@ impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Handle<'a, T> {
         // though it need only "poll" at half hour intervals.
         // TODO
         let res = self.wait_inner(
-            cmd_rx,
-            cmd_tx,
             idle_tx,
             kill_rx,
         ).await;
