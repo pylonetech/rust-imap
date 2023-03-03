@@ -5,7 +5,7 @@ use crate::client::Session;
 use crate::error::Result;
 use crate::parse::parse_idle;
 use crate::types::UnsolicitedResponse;
-use tokio::{io::{AsyncRead, AsyncWrite}, sync::{mpsc::UnboundedSender, oneshot}};
+use tokio::{io::{AsyncRead, AsyncWrite}, sync::{mpsc::UnboundedSender, oneshot}, time::Instant, task};
 use std::time::Duration;
 
 /// `Handle` allows a client to block waiting for changes to the remote mailbox.
@@ -178,7 +178,7 @@ impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Handle<'a, T> {
     /// Block until the given callback returns `false`, or until a response
     /// arrives that is not explicitly handled by [`UnsolicitedResponse`].
     pub async fn wait_while(
-        &mut self,
+        mut self,
         idle_tx: UnboundedSender<UnsolicitedResponse>,
         kill_rx: oneshot::Receiver<()>,
     ) -> Result<()>
@@ -196,7 +196,7 @@ impl<'a, T: AsyncRead + AsyncWrite + std::marker::Unpin + 'a> Handle<'a, T> {
             idle_tx,
             kill_rx,
         ).await;
-        self.terminate().await.unwrap();
+        let _ = self.terminate().await.is_ok();
         res
     }
 }
